@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Capture Viewer</title>
+  <link rel="stylesheet" href="viewer.css">
+</head>
+<body>
+  <header class="bar">
+    <h1>Capture Viewer</h1>
+
+    <form id="connect-form" class="connect">
+      <label for="url">Capture client</label>
+      <input id="url" type="text" inputmode="url" spellcheck="false" autocomplete="off" value="ws://localhost:8081/">
+      <button id="connect" type="submit" class="primary">Connect</button>
+    </form>
+
+    <p id="status" class="status" data-state="idle" role="status">Not connected</p>
+  </header>
+
+  <main>
+    <section class="stage" id="stage" aria-label="Screens">
+      <div class="stage-head">
+        <h2>Screens</h2>
+        <span id="paused-badge" class="pill" data-state="paused" hidden>Streaming paused</span>
+        <span class="spacer"></span>
+        <button id="unmute" type="button" hidden>Turn sound on</button>
+        <button id="mute" type="button" disabled>Mute</button>
+        <button id="fullscreen" type="button" disabled>Full screen</button>
+      </div>
+
+      <div id="tiles" class="tiles"></div>
+
+      <div id="placeholder" class="placeholder">
+        <p class="placeholder-title" id="placeholder-title">Not connected</p>
+        <p id="placeholder-text">Start the capture client, then press Connect.</p>
+      </div>
+    </section>
+
+    <aside class="panel">
+      <section id="control" aria-label="Remote control">
+        <h2>Remote control</h2>
+        <p id="control-note" class="note">Connect to control the capture client.</p>
+
+        <div class="control-row">
+          <div class="control-head">
+            <span class="control-name">Recording</span>
+            <span id="recording-state" class="pill" data-state="unknown">–</span>
+          </div>
+          <p id="recording-detail" class="detail">&nbsp;</p>
+          <div class="buttons" role="group" aria-label="Recording">
+            <button id="recording-start" type="button" disabled>Start</button>
+            <button id="recording-pause" type="button" disabled>Pause</button>
+            <button id="recording-stop" type="button" disabled>Stop</button>
+          </div>
+        </div>
+
+        <div class="control-row">
+          <div class="control-head">
+            <span class="control-name">Streaming</span>
+            <span id="streaming-state" class="pill" data-state="unknown">–</span>
+          </div>
+          <p id="streaming-detail" class="detail">&nbsp;</p>
+          <div class="buttons" role="group" aria-label="Streaming">
+            <button id="streaming-start" type="button" disabled>Start</button>
+            <button id="streaming-pause" type="button" disabled>Pause</button>
+            <button id="streaming-stop" type="button" disabled>Stop</button>
+          </div>
+        </div>
+
+        <div class="settings">
+          <label for="layout">Layout</label>
+          <select id="layout" disabled>
+            <option value="separate">Each screen separately</option>
+            <option value="desktop">Whole desktop</option>
+          </select>
+
+          <label for="video-mode">Video method</label>
+          <select id="video-mode" disabled>
+            <option value="h264">H.264 over WebRTC</option>
+            <option value="jpeg">JPEG pictures</option>
+          </select>
+
+          <label for="frame-rate">Frame rate</label>
+          <span class="with-unit">
+            <input id="frame-rate" type="number" min="1" max="60" step="1" inputmode="numeric" list="frame-rates" disabled>
+            <span>fps</span>
+          </span>
+          <datalist id="frame-rates">
+            <option value="5"></option>
+            <option value="10"></option>
+            <option value="15"></option>
+            <option value="24"></option>
+            <option value="30"></option>
+            <option value="60"></option>
+          </datalist>
+
+          <label for="audio-source">Audio source</label>
+          <select id="audio-source" disabled>
+            <option value="microphone">Microphone</option>
+            <option value="desktop">Desktop audio</option>
+            <option value="both">Both, mixed</option>
+            <option value="none">None (silence)</option>
+          </select>
+        </div>
+      </section>
+
+      <section aria-label="Screens to watch">
+        <h2>Watch</h2>
+        <ul id="screens" class="screens"></ul>
+      </section>
+
+      <section aria-label="Video statistics">
+        <h2>Video</h2>
+        <dl id="video-stats"></dl>
+      </section>
+      <section aria-label="Audio statistics">
+        <h2>Audio</h2>
+        <dl id="audio-stats"></dl>
+        <div class="level">
+          <span id="level-label">Level</span>
+          <meter id="level" min="0" max="1" value="0" aria-labelledby="level-label"></meter>
+        </div>
+      </section>
+      <section aria-label="Connection statistics">
+        <h2>Connection</h2>
+        <dl id="connection-stats"></dl>
+      </section>
+    </aside>
+
+    <section class="log" aria-label="Events">
+      <div class="log-head">
+        <h2>Events</h2>
+        <button id="clear-log" type="button">Clear</button>
+      </div>
+      <ol id="log" aria-live="polite"></ol>
+    </section>
+  </main>
+
+  <audio id="audio" hidden></audio>
+
+  <template id="tile-template">
+    <figure class="tile">
+      <figcaption class="tile-bar">
+        <span class="tile-name"></span>
+        <span class="tile-info"></span>
+        <span class="spacer"></span>
+        <button class="tile-zoom" type="button" title="Zoom: scroll the mouse wheel over the picture, drag to move around, double-click to reset. Click here to reset.">100%</button>
+        <button class="tile-fullscreen" type="button">Full screen</button>
+        <button class="tile-popout" type="button">Pop out</button>
+      </figcaption>
+      <div class="tile-view">
+        <video playsinline muted></video>
+        <canvas hidden></canvas>
+        <p class="tile-wait">Waiting for video…</p>
+      </div>
+    </figure>
+  </template>
+
+  <script type="module" src="viewer.js"></script>
+</body>
+</html>
