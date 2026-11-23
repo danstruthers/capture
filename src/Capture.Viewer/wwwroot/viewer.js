@@ -10,7 +10,7 @@
 // the page is drawn from that session's state by render(). What differs between the main window
 // and a pop-out is in one place: the window's role (mainRole, popoutRole).
 
-import { describeCodec, EMPTY, formatBitRate, formatBytes, formatCount, formatDuration, formatMilliseconds } from './format.js';
+import { describeCodec, EMPTY, formatBitRate, formatBytes, formatCount, formatDuration, formatFrameRate, formatMilliseconds } from './format.js';
 import { PcmPlayer } from './pcm-player.js';
 import {
   addressFor, AUDIO_MESSAGE, commandMessage, configureMessage, isDefaultDeviceEntry, parseMediaMessage, pcmSamples, PICTURE_MESSAGE, selectMessage,
@@ -30,8 +30,8 @@ const STAT_FIELDS = {
 
 const parameters = new URLSearchParams(location.search);
 
-/** What this window is for: see mainRole and popoutRole. */
-const role = parameters.has('popout') ? popoutRole(parameters.get('popout')) : mainRole();
+/** What this window is for: see mainRole and popoutRole. A ?popout= that names no stream is the main window. */
+const role = parameters.get('popout') ? popoutRole(parameters.get('popout')) : mainRole();
 
 const byId = (id) => document.getElementById(id);
 
@@ -117,9 +117,14 @@ function mainRole() {
       .filter((source) => !deselected.has(source.id) && !popouts.has(source.id))
       .sort((a, b) => a.left - b.left || a.top - b.top),
     /** Title and text for the stage while streaming is on but no stream is shown. */
-    describeNothingShown: (state) => (state.sources.length > 0 && state.sources.every((source) => popouts.has(source.id))
-      ? ['Every screen is in its own window', 'Close one of those windows, or press Bring back under Watch.']
-      : ['No screen selected', 'Tick a screen under Watch.']),
+    describeNothingShown(state) {
+      if (state.sources.length === 0) {
+        return ['No screens to show', 'The capture client offers no screens right now.'];
+      }
+      return state.sources.every((source) => popouts.has(source.id))
+        ? ['Every screen is in its own window', 'Close one of those windows, or press Bring back under Watch.']
+        : ['No screen selected', 'Tick a screen under Watch.'];
+    },
     /** Sets up a tile's window button. */
     setUpWindowButton(button, id) {
       button.title = 'Show this screen in a window of its own';
@@ -631,17 +636,18 @@ class Session {
 
     // Statistics: polled every second (pollStats).
     this.statsTimer = 0;
-    this.rateMemory = {}; // the counters at the last poll, for rates
+    this.polling = false; // a poll is waiting for the browser's statistics; the next one is skipped
+    this.rateMemory = {}; // the counters at the last poll, for rates and averages since then
     this.snapshot = { state: 'connecting' };
   }
 
   static noRtc() {
     return {
       peer: null,
-      earlyCandidates: [],      // candidates that arrived before their offer was set
       tracks: new Map(),        // stream id -> video track
       trackToSource: new Map(), // track id -> stream id
       connectedAt: 0,
+      failure: null,            // why the last offer could not be answered
     };
   }
 
@@ -667,7 +673,6 @@ function connect() {
   }
 
   disconnect();
-  role.rememberAddress(url);
 
   const s = new Session(url);
   try {
@@ -676,6 +681,7 @@ function connect() {
     setStatus('error', `That address cannot be used: ${error.message}`);
     return;
   }
+  role.rememberAddress(url); // only an address the browser accepts
 
   s.socket.binaryType = 'arraybuffer';
   session = s;
@@ -766,10 +772,10 @@ async function handleMessage(s, data) {
         await acceptOffer(s, message);
       }
     } else if (message.candidate) {
+      // The capture client sends a connection's candidates after its offer, and messages are
+      // handled in order, so a candidate with no offer set belongs to a connection already closed.
       if (s.rtc.peer?.remoteDescription) {
         await s.rtc.peer.addIceCandidate(message);
-      } else {
-        s.rtc.earlyCandidates.push(message); // a candidate cannot be applied before the offer it belongs to
       }
     }
   } catch (error) {
@@ -826,6 +832,8 @@ function refreshStatus(s) {
   } else if (state.video.mode === 'jpeg') {
     const live = [...s.media.pictures.values()].some((counters) => counters.shown > 0);
     setStatus(live ? 'live' : 'connecting', live ? 'Live · JPEG' : 'Waiting for pictures…');
+  } else if (s.rtc.failure) {
+    setStatus('error', `The H.264 stream could not start: ${s.rtc.failure}`);
   } else {
     const connected = s.rtc.peer?.connectionState === 'connected';
     setStatus(connected ? 'live' : 'connecting', connected ? 'Live · H.264' : 'Starting the stream…');
@@ -1139,7 +1147,6 @@ async function acceptOffer(s, offer) {
 
   const peer = new RTCPeerConnection();
   s.rtc.peer = peer;
-  s.rtc.connectedAt = 0;
   s.rateMemory = {};
   const sourceByMid = new Map(Object.entries(offer.sources ?? {}));
   log(`Offer received (${sourceByMid.size} video stream${sourceByMid.size === 1 ? '' : 's'}${/^m=audio/m.test(offer.sdp) ? ' and audio' : ''})`);
@@ -1162,44 +1169,57 @@ async function acceptOffer(s, offer) {
     refreshStatus(s);
   };
 
-  await peer.setRemoteDescription({ type: 'offer', sdp: offer.sdp });
+  try {
+    await peer.setRemoteDescription({ type: 'offer', sdp: offer.sdp });
 
-  // Each transceiver's mid says which stream its track carries; the tracks exist from here on and
-  // start delivering pictures once the connection is up.
-  for (const transceiver of peer.getTransceivers()) {
-    const track = transceiver.receiver.track;
-    if (track.kind === 'audio') {
-      if (role.playsAudio) {
-        playAudio(track);
+    // Each transceiver's mid says which stream its track carries; the tracks exist from here on and
+    // start delivering pictures once the connection is up.
+    for (const transceiver of peer.getTransceivers()) {
+      const track = transceiver.receiver.track;
+      if (track.kind === 'audio') {
+        if (role.playsAudio) {
+          playAudio(track);
+        }
+      } else if (sourceByMid.has(transceiver.mid)) {
+        const id = sourceByMid.get(transceiver.mid);
+        s.rtc.tracks.set(id, track);
+        s.rtc.trackToSource.set(track.id, id);
       }
-    } else if (sourceByMid.has(transceiver.mid)) {
-      const id = sourceByMid.get(transceiver.mid);
-      s.rtc.tracks.set(id, track);
-      s.rtc.trackToSource.set(track.id, id);
+      // A live view: ask for the smallest receive buffer the network allows.
+      if ('jitterBufferTarget' in transceiver.receiver) {
+        transceiver.receiver.jitterBufferTarget = 0;
+      }
     }
-    // A live view: ask for the smallest receive buffer the network allows.
-    if ('jitterBufferTarget' in transceiver.receiver) {
-      transceiver.receiver.jitterBufferTarget = 0;
-    }
-  }
-  render(); // the tiles get their tracks
+    render(); // the tiles get their tracks
 
-  for (const candidate of s.rtc.earlyCandidates.splice(0)) {
-    await peer.addIceCandidate(candidate);
+    await peer.setLocalDescription(await peer.createAnswer());
+  } catch (error) {
+    // A connection that cannot answer its offer is no use: close it, and say why there is no
+    // picture until the capture client makes a new offer.
+    if (s.rtc.peer === peer) {
+      closePeer(s);
+      s.rtc.failure = error.message;
+      render();
+      refreshStatus(s);
+    }
+    throw error; // handleMessage logs it
   }
-  await peer.setLocalDescription(await peer.createAnswer());
+
   if (s.rtc.peer === peer) {
     send(peer.localDescription);
   }
 }
 
+/** Closes the WebRTC connection, if there is one, and forgets everything about it. */
 function closePeer(s) {
-  if (!s.rtc.peer) {
+  const peer = s.rtc.peer;
+  s.rtc = Session.noRtc();
+  if (!peer) {
     return;
   }
-  s.rtc.peer.close();
-  s.rtc = Session.noRtc();
+  peer.close();
   el.webrtcAudio.srcObject = null;
+  el.unmute.hidden = true; // the sound it was for has gone
   for (const tile of tiles.values()) {
     tile.attach(null);
   }
@@ -1223,10 +1243,15 @@ async function playAudio(track) {
 // JPEG mode: pictures and PCM audio over the WebSocket
 // ---------------------------------------------------------------------------------------------
 
+/** Whether pictures and PCM audio come over the WebSocket: in JPEG mode, unless streaming is stopped. */
+function socketMediaFlows(s) {
+  return s.state !== null && s.state.streaming.state !== 'stopped' && s.state.video.mode === 'jpeg';
+}
+
 function handleMedia(s, buffer) {
   const message = parseMediaMessage(buffer);
-  if (!message || s.state?.video.mode !== 'jpeg') {
-    return;
+  if (!message || !socketMediaFlows(s)) {
+    return; // late media, sent before streaming stopped or the mode changed
   }
 
   if (message.type === PICTURE_MESSAGE) {
@@ -1262,7 +1287,7 @@ async function showPicture(s, id, counters, jpeg) {
     for (let next = jpeg; next; next = counters.pending, counters.pending = null) {
       const bitmap = await createImageBitmap(new Blob([next], { type: 'image/jpeg' }));
       const tile = tiles.get(id);
-      if (session !== s || s.state?.video.mode !== 'jpeg' || !tile) {
+      if (session !== s || !socketMediaFlows(s) || !tile) {
         bitmap.close();
         return;
       }
@@ -1280,6 +1305,12 @@ async function showPicture(s, id, counters, jpeg) {
     log(`A picture of ${sourceName(id)} could not be shown: ${error.message}`, 'error');
   } finally {
     counters.decoding = false;
+    if (counters.pending) {
+      // The loop ended early (a picture failed, or the tile went away). The waiting picture is
+      // dropped: shown later, it would be drawn after a newer one.
+      counters.skipped++;
+      counters.pending = null;
+    }
   }
 }
 
@@ -1309,6 +1340,7 @@ function closeSocketMedia(s) {
 
   s.media.pcm?.close();
   s.media = Session.noMedia();
+  el.unmute.hidden = true; // the sound it was for has gone
   s.rateMemory = {};
   for (const tile of tiles.values()) {
     tile.clearPicture();
@@ -1329,6 +1361,33 @@ function rateOf(s, key, value, timestamp) {
   return ((value - previous.value) * 1000) / (timestamp - previous.timestamp);
 }
 
+/**
+ * The average of something since the previous poll: the change in its total over the change in its
+ * count. Undefined at the first poll, or when nothing was counted in between.
+ */
+function averageSinceLastPoll(s, key, total, count) {
+  const previous = s.rateMemory[key];
+  s.rateMemory[key] = { total, count };
+  if (total === undefined || count === undefined || !previous || count <= previous.count) {
+    return undefined;
+  }
+  return (total - previous.total) / (count - previous.count);
+}
+
+/** Rounded to the given number of decimal places; an unknown value stays unknown. */
+function roundTo(value, places) {
+  if (value === undefined) {
+    return undefined;
+  }
+  const scale = 10 ** places;
+  return Math.round(value * scale) / scale;
+}
+
+/** Seconds as whole milliseconds; an unknown value stays unknown. */
+function wholeMilliseconds(seconds) {
+  return seconds === undefined ? undefined : Math.round(seconds * 1000);
+}
+
 function describeCandidate(candidate) {
   if (!candidate) {
     return '?';
@@ -1337,23 +1396,30 @@ function describeCandidate(candidate) {
   return address ? `${candidate.candidateType} ${address}:${candidate.port}` : candidate.candidateType;
 }
 
-/** Totals over the streams shown in this window, for the Video panel. */
+/** Totals over the streams shown in this window, for the Video panel; over the streams that know each number. */
 function summarizeVideo(perSource) {
   const shown = [...tiles.keys()].map((id) => perSource[id]).filter(Boolean);
   if (shown.length === 0) {
     return null;
   }
-  const sum = (key) => shown.reduce((total, stats) => total + (stats[key] ?? 0), 0);
+  const known = (key) => shown.map((stats) => stats[key]).filter((value) => value !== undefined);
+  const total = (values) => values.reduce((sum, value) => sum + value, 0);
+  const sum = (key) => {
+    const values = known(key);
+    return values.length === 0 ? undefined : total(values);
+  };
+  const frameRates = known('framesPerSecond');
+  const jitters = known('jitterMs');
   return {
     streams: shown.length,
     codec: shown[0].codec,
-    framesPerSecond: Math.round((sum('framesPerSecond') / shown.length) * 10) / 10,
+    framesPerSecond: frameRates.length === 0 ? undefined : roundTo(total(frameRates) / frameRates.length, 1),
     bitsPerSecond: sum('bitsPerSecond'),
     framesDecoded: sum('framesDecoded'),
     framesDropped: sum('framesDropped'),
-    keyFramesDecoded: shown[0].keyFramesDecoded === undefined ? undefined : sum('keyFramesDecoded'),
-    packetsLost: shown[0].packetsLost === undefined ? undefined : sum('packetsLost'),
-    jitterMs: shown[0].jitterMs === undefined ? undefined : Math.max(...shown.map((stats) => stats.jitterMs ?? 0)),
+    keyFramesDecoded: sum('keyFramesDecoded'),
+    packetsLost: sum('packetsLost'),
+    jitterMs: jitters.length === 0 ? undefined : Math.max(...jitters),
   };
 }
 
@@ -1361,7 +1427,7 @@ function showVideoSummary(video) {
   showStats('video', video && {
     'Streams': String(video.streams),
     'Codec': video.codec,
-    'Frame rate': `${video.framesPerSecond} fps`,
+    'Frame rate': formatFrameRate(video.framesPerSecond),
     'Bit rate': formatBitRate(video.bitsPerSecond),
     'Frames shown': formatCount(video.framesDecoded),
     'Frames dropped': formatCount(video.framesDropped),
@@ -1375,7 +1441,7 @@ function showTileInfo(perSource) {
   for (const [id, tile] of tiles) {
     const stats = perSource[id];
     tile.setInfo(stats?.width
-      ? `${stats.width} × ${stats.height} · ${stats.framesPerSecond} fps · ${formatBitRate(stats.bitsPerSecond)}`
+      ? `${stats.width} × ${stats.height} · ${formatFrameRate(stats.framesPerSecond)} · ${formatBitRate(stats.bitsPerSecond)}`
       : '');
   }
 }
@@ -1383,6 +1449,7 @@ function showTileInfo(perSource) {
 /**
  * What one statistics poll found, whichever way the media came: each source of statistics below
  * (measureControlOnly, measureSocketMedia, measurePeer) fills one of these, and pollStats shows it.
+ * A number not known yet is left out (a rate needs two polls), and its panel shows a dash.
  * @typedef {object} Measurements
  * @property {Object<string, StreamStats>} sources   by stream id
  * @property {AudioStats|null} audio
@@ -1391,20 +1458,21 @@ function showTileInfo(perSource) {
  * @property {string} [state]            the WebRTC connection's state, when there is one
  *
  * @typedef {object} StreamStats
- * @property {number} width
- * @property {number} height
- * @property {number} framesPerSecond
- * @property {number} bitsPerSecond
+ * @property {number} [width]
+ * @property {number} [height]
+ * @property {number} [framesPerSecond]
+ * @property {number} [bitsPerSecond]
  * @property {string} codec              'JPEG', or the WebRTC codec ('H.264 Constrained Baseline')
- * @property {number} framesDecoded      pictures shown
- * @property {number} framesDropped
+ * @property {number} [framesDecoded]    pictures shown
+ * @property {number} [framesDropped]
  *
  * @typedef {object} AudioStats
  * @property {string} codec
- * @property {number} bitsPerSecond
- * @property {number} packetsReceived
+ * @property {number} [bitsPerSecond]
+ * @property {number} [packetsReceived]
  * @property {number} [packetsLost]      WebRTC only
- * @property {number} [bufferedSeconds]
+ * @property {number} [bufferedSeconds]  how long sound waits before it is played, now: in JPEG mode the
+ *                                       PCM queued, in WebRTC the jitter buffer's delay since the last poll
  *
  * @typedef {object} ConnectionStats
  * @property {string} transport
@@ -1432,38 +1500,44 @@ function showTileInfo(perSource) {
  */
 
 async function pollStats(s) {
-  if (session !== s) {
-    return;
+  if (session !== s || s.polling) {
+    return; // a newer connection, or the last poll is still waiting for the browser's statistics
   }
 
-  const state = s.state;
-  const jpeg = state !== null && state.streaming.state !== 'stopped' && state.video.mode === 'jpeg';
-  const found = jpeg ? measureSocketMedia(s) : s.rtc.peer ? await measurePeer(s) : measureControlOnly(s);
-  if (session !== s || !found) {
-    return; // a newer connection, or the WebRTC connection went away while it was asked
+  s.polling = true;
+  try {
+    const found = socketMediaFlows(s) ? measureSocketMedia(s) : s.rtc.peer ? await measurePeer(s) : measureControlOnly(s);
+    if (session !== s || !found) {
+      return; // a newer connection, or the WebRTC connection went away while it was asked
+    }
+
+    const video = summarizeVideo(found.sources);
+    showVideoSummary(video);
+    showTileInfo(found.sources);
+    showAudioStats(found.audio);
+    el.level.value = found.level;
+    showConnectionStats(found.connection);
+
+    // Read after the wait for the statistics, so that the snapshot describes one moment.
+    const state = s.state;
+
+    /** @type {StatsSnapshot} */
+    s.snapshot = {
+      state: found.state ?? (s.socketOpened ? 'connected' : 'connecting'),
+      mode: state?.video.mode ?? null,
+      streaming: state?.streaming.state ?? null,
+      recording: state?.recording.state ?? null,
+      layout: state?.layout ?? null,
+      tiles: [...tiles.keys()],
+      popouts: [...popouts.keys()],
+      zoom: Object.fromEntries([...tiles].map(([id, tile]) => [id, Math.round(tile.zoom.scale * 100) / 100])),
+      sources: found.sources,
+      video,
+      audio: found.audio,
+    };
+  } finally {
+    s.polling = false;
   }
-
-  const video = summarizeVideo(found.sources);
-  showVideoSummary(video);
-  showTileInfo(found.sources);
-  showAudioStats(found.audio);
-  el.level.value = found.level;
-  showConnectionStats(found.connection);
-
-  /** @type {StatsSnapshot} */
-  s.snapshot = {
-    state: found.state ?? (s.socketOpened ? 'connected' : 'connecting'),
-    mode: state?.video.mode ?? null,
-    streaming: state?.streaming.state ?? null,
-    recording: state?.recording.state ?? null,
-    layout: state?.layout ?? null,
-    tiles: [...tiles.keys()],
-    popouts: [...popouts.keys()],
-    zoom: Object.fromEntries([...tiles].map(([id, tile]) => [id, Math.round(tile.zoom.scale * 100) / 100])),
-    sources: found.sources,
-    video,
-    audio: found.audio,
-  };
 }
 
 function showAudioStats(audio) {
@@ -1501,13 +1575,11 @@ function measureSocketMedia(s) {
   const now = performance.now();
   const sources = {};
   for (const [id, counters] of s.media.pictures) {
-    const frameRate = rateOf(s, `pictures:${id}`, counters.shown, now);
-    const bits = rateOf(s, `pictureBits:${id}`, counters.bytes * 8, now);
     sources[id] = {
       width: counters.width,
       height: counters.height,
-      framesPerSecond: Math.round((frameRate ?? 0) * 10) / 10,
-      bitsPerSecond: Math.round(bits ?? 0),
+      framesPerSecond: roundTo(rateOf(s, `pictures:${id}`, counters.shown, now), 1),
+      bitsPerSecond: roundTo(rateOf(s, `pictureBits:${id}`, counters.bytes * 8, now), 0),
       codec: 'JPEG',
       framesDecoded: counters.shown,
       framesDropped: counters.skipped,
@@ -1519,10 +1591,10 @@ function measureSocketMedia(s) {
   const audioBits = rateOf(s, 'audioBits', pcmCounters.bytes * 8, now);
   const audio = pcmCounters.blocks === 0 ? null : {
     codec: 'PCM 16-bit, 8 kHz',
-    bitsPerSecond: Math.round(audioBits ?? 0),
+    bitsPerSecond: roundTo(audioBits, 0),
     packetsReceived: pcmCounters.blocks,
     totalSamplesReceived: pcmCounters.samples,
-    bufferedSeconds: pcm ? Math.round(pcm.buffered * 1000) / 1000 : 0,
+    bufferedSeconds: roundTo(pcm?.buffered, 4),
     contextState: pcm?.context.state ?? null,
   };
 
@@ -1576,34 +1648,34 @@ async function measurePeer(s) {
     if (!id) {
       continue;
     }
-    const bitRate = rateOf(s, `video:${id}`, video.bytesReceived * 8, video.timestamp);
     sources[id] = {
-      width: video.frameWidth ?? 0,
-      height: video.frameHeight ?? 0,
-      framesPerSecond: video.framesPerSecond ?? 0,
-      bitsPerSecond: Math.round(bitRate ?? 0),
+      width: video.frameWidth,
+      height: video.frameHeight,
+      framesPerSecond: video.framesPerSecond,
+      bitsPerSecond: roundTo(rateOf(s, `video:${id}`, video.bytesReceived * 8, video.timestamp), 0),
       codec: describeCodec(stats.get(video.codecId)),
-      framesDecoded: video.framesDecoded ?? 0,
-      framesDropped: video.framesDropped ?? 0,
-      keyFramesDecoded: video.keyFramesDecoded ?? 0,
-      packetsReceived: video.packetsReceived ?? 0,
-      packetsLost: video.packetsLost ?? 0,
-      jitterMs: Math.round((video.jitter ?? 0) * 1000),
+      framesDecoded: video.framesDecoded,
+      framesDropped: video.framesDropped,
+      keyFramesDecoded: video.keyFramesDecoded,
+      packetsReceived: video.packetsReceived,
+      packetsLost: video.packetsLost,
+      jitterMs: wholeMilliseconds(video.jitter),
     };
   }
 
   let audioStats = null;
   if (audio && role.playsAudio) {
-    const bitRate = rateOf(s, 'audio', audio.bytesReceived * 8, audio.timestamp);
     audioStats = {
       codec: describeCodec(stats.get(audio.codecId)),
-      bitsPerSecond: Math.round(bitRate ?? 0),
-      packetsReceived: audio.packetsReceived ?? 0,
-      packetsLost: audio.packetsLost ?? 0,
-      bufferedSeconds: audio.jitterBufferEmittedCount ? audio.jitterBufferDelay / audio.jitterBufferEmittedCount : undefined,
-      totalSamplesReceived: audio.totalSamplesReceived ?? 0,
-      jitterMs: Math.round((audio.jitter ?? 0) * 1000),
-      audioLevel: audio.audioLevel ?? 0,
+      bitsPerSecond: roundTo(rateOf(s, 'audio', audio.bytesReceived * 8, audio.timestamp), 0),
+      packetsReceived: audio.packetsReceived,
+      packetsLost: audio.packetsLost,
+      // The jitter buffer's delay since the last poll, not over the connection's life: like the
+      // PCM queue in JPEG mode, it says how things are now.
+      bufferedSeconds: roundTo(averageSinceLastPoll(s, 'audioDelay', audio.jitterBufferDelay, audio.jitterBufferEmittedCount), 4),
+      totalSamplesReceived: audio.totalSamplesReceived,
+      jitterMs: wholeMilliseconds(audio.jitter),
+      audioLevel: audio.audioLevel,
     };
   }
 

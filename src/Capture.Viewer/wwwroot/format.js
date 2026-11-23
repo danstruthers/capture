@@ -12,6 +12,10 @@ export function formatBitRate(bitsPerSecond) {
     : `${Math.round(bitsPerSecond / 1000)} kbit/s`;
 }
 
+export function formatFrameRate(framesPerSecond) {
+  return framesPerSecond === undefined ? EMPTY : `${framesPerSecond} fps`;
+}
+
 export function formatMilliseconds(seconds) {
   return seconds === undefined ? EMPTY : `${(seconds * 1000).toFixed(1)} ms`;
 }
