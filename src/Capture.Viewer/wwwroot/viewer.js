@@ -6,8 +6,9 @@
 // a window of its own: a popped-out screen is this same page in a window of its own
 // (?popout=<stream id>), with its own connection that asks for that one stream and no audio.
 //
-// The messages are in protocol.js. The page keeps one session per connection (see connect()), and
-// everything on the page is drawn from that session's state by render().
+// The messages are in protocol.js. The page keeps one Session per connection, and everything on
+// the page is drawn from that session's state by render(). What differs between the main window
+// and a pop-out is in one place: the window's role (mainRole, popoutRole).
 
 import { describeCodec, EMPTY, formatBitRate, formatBytes, formatCount, formatDuration, formatMilliseconds } from './format.js';
 import { PcmPlayer } from './pcm-player.js';
@@ -29,8 +30,8 @@ const STAT_FIELDS = {
 
 const parameters = new URLSearchParams(location.search);
 
-/** In a pop-out window: the id of the one stream it shows. */
-const POPOUT_STREAM_ID = parameters.get('popout');
+/** What this window is for: see mainRole and popoutRole. */
+const role = parameters.has('popout') ? popoutRole(parameters.get('popout')) : mainRole();
 
 const byId = (id) => document.getElementById(id);
 
@@ -97,6 +98,73 @@ let audioListKey = '';
 
 /** The id of the last command or configure request; an error refusing a request carries its id. */
 let lastRequestId = 0;
+
+// ---------------------------------------------------------------------------------------------
+// The window's role: the main window, or a pop-out showing one stream
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The main window shows the streams the person ticks (less those popped out), plays the sound,
+ * holds the controls and remembers the address.
+ */
+function mainRole() {
+  return {
+    hasControls: true,
+    playsAudio: true,
+    socketAddress: (url) => url,
+    /** The streams to show, in the order the screens are arranged. */
+    wantedSources: (sources) => sources
+      .filter((source) => !deselected.has(source.id) && !popouts.has(source.id))
+      .sort((a, b) => a.left - b.left || a.top - b.top),
+    /** Title and text for the stage while streaming is on but no stream is shown. */
+    describeNothingShown: (state) => (state.sources.length > 0 && state.sources.every((source) => popouts.has(source.id))
+      ? ['Every screen is in its own window', 'Close one of those windows, or press Bring back under Watch.']
+      : ['No screen selected', 'Tick a screen under Watch.']),
+    /** Sets up a tile's window button. */
+    setUpWindowButton(button, id) {
+      button.title = 'Show this screen in a window of its own';
+      button.addEventListener('click', () => popOut(id));
+    },
+    titleFor: () => null, // the page's own
+    rememberAddress(url) {
+      try {
+        localStorage.setItem(URL_STORAGE_KEY, url);
+      } catch {
+        // Storage can be unavailable (private window, file:// page); the address just is not remembered.
+      }
+    },
+    savedAddress() {
+      try {
+        return localStorage.getItem(URL_STORAGE_KEY);
+      } catch {
+        return null;
+      }
+    },
+  };
+}
+
+/**
+ * A pop-out (?popout=<stream id>) is this same page in a window of its own, with its own
+ * connection: it shows its one stream, silently, and nothing else.
+ */
+function popoutRole(id) {
+  return {
+    hasControls: false,
+    playsAudio: false,
+    // It asks for its one stream and no audio as it connects, so it is never sent anything else.
+    socketAddress: (url) => addressFor(url, id),
+    wantedSources: (sources) => sources.filter((source) => source.id === id),
+    describeNothingShown: () => [`${sourceName(id)} is no longer captured`, 'The capture client changed its layout. Close this window.'],
+    setUpWindowButton(button) {
+      button.textContent = 'Close';
+      button.title = 'Close this window. The screen goes back to the main window.';
+      button.addEventListener('click', () => window.close());
+    },
+    titleFor: (state) => `${state?.sources.find((source) => source.id === id)?.name ?? id} – Capture Viewer`,
+    rememberAddress() {}, // the main window's address is the one to remember
+    savedAddress: () => null,
+  };
+}
 
 // ---------------------------------------------------------------------------------------------
 // Page chrome
@@ -213,14 +281,7 @@ class Tile {
     this.zoomButton.addEventListener('click', () => this.zoom.reset());
     this.fullscreenButton.addEventListener('click', () => toggleFullscreen(this.element));
 
-    if (POPOUT_STREAM_ID) {
-      this.popoutButton.textContent = 'Close';
-      this.popoutButton.title = 'Close this window. The screen goes back to the main window.';
-      this.popoutButton.addEventListener('click', () => window.close());
-    } else {
-      this.popoutButton.title = 'Show this screen in a window of its own';
-      this.popoutButton.addEventListener('click', () => popOut(this.id));
-    }
+    role.setUpWindowButton(this.popoutButton, this.id);
 
     this.video.addEventListener('resize', () => {
       if (this.video.videoWidth > 0) {
@@ -301,22 +362,11 @@ class Tile {
   }
 }
 
-/** The streams this window shows: everything ticked that is not in a window of its own, or the one stream of a pop-out. */
-function wantedSources() {
-  const sources = session?.state?.sources ?? [];
-  if (POPOUT_STREAM_ID) {
-    return sources.filter((source) => source.id === POPOUT_STREAM_ID);
-  }
-  return sources
-    .filter((source) => !deselected.has(source.id) && !popouts.has(source.id))
-    .sort((a, b) => a.left - b.left || a.top - b.top); // as the screens are arranged
-}
-
 /** Brings the tiles in line with the streams this window should show. */
 function renderTiles() {
   const s = session;
   const state = s?.state;
-  const wanted = state && state.streaming.state !== 'stopped' ? wantedSources() : [];
+  const wanted = state && state.streaming.state !== 'stopped' ? role.wantedSources(state.sources) : [];
   const wantedIds = new Set(wanted.map((source) => source.id));
 
   for (const [id, tile] of tiles) {
@@ -336,7 +386,7 @@ function renderTiles() {
       tiles.set(source.id, tile);
     }
     tile.setMode(jpeg);
-    tile.attach(jpeg ? null : s.tracks.get(source.id) ?? null);
+    tile.attach(jpeg ? null : s.rtc.tracks.get(source.id) ?? null);
   }
 
   // Re-append only when the order is wrong: moving a playing video element can interrupt it.
@@ -379,16 +429,7 @@ function updatePlaceholder() {
     title = 'Streaming is stopped';
     text = state.remoteControl ? 'Press Start under Streaming to watch.' : 'It has to be started on the capture client.';
   } else if (tiles.size === 0) {
-    if (POPOUT_STREAM_ID) {
-      title = `${sourceName(POPOUT_STREAM_ID)} is no longer captured`;
-      text = 'The capture client changed its layout. Close this window.';
-    } else if (state.sources.length > 0 && state.sources.every((source) => popouts.has(source.id))) {
-      title = 'Every screen is in its own window';
-      text = 'Close one of those windows, or press Bring back under Watch.';
-    } else {
-      title = 'No screen selected';
-      text = 'Tick a screen under Watch.';
-    }
+    [title, text] = role.describeNothingShown(state);
   }
 
   el.placeholder.hidden = s !== null && state !== null && tiles.size > 0;
@@ -402,7 +443,7 @@ function syncSelection() {
   if (!s?.state || s.socket.readyState !== WebSocket.OPEN) {
     return;
   }
-  const message = selectMessage([...tiles.keys()].sort(), !POPOUT_STREAM_ID);
+  const message = selectMessage([...tiles.keys()].sort(), role.playsAudio);
   const key = JSON.stringify(message);
   if (key !== s.lastSelection) {
     s.lastSelection = key;
@@ -412,7 +453,7 @@ function syncSelection() {
 
 /** The list under Watch: a tick box and a pop-out button per stream. */
 function renderScreenList() {
-  if (POPOUT_STREAM_ID) {
+  if (!role.hasControls) {
     return;
   }
 
@@ -559,8 +600,62 @@ setInterval(() => {
 // Connection
 // ---------------------------------------------------------------------------------------------
 
-function newPictureCounters() {
-  return { decoding: false, pending: null, received: 0, shown: 0, skipped: 0, bytes: 0, width: 0, height: 0 };
+/**
+ * One connection to the capture client, and everything learned through it. Every connection gets
+ * a new session, and the handlers of a connection check that its session is still the current one
+ * (`session === s`), so that nothing from an old connection reaches the page.
+ */
+class Session {
+  constructor(url) {
+    this.url = url;
+
+    // The WebSocket: control messages both ways, and media in JPEG mode.
+    this.socket = null;
+    this.socketOpened = false;
+    this.openedAt = 0;
+    this.bytesReceived = 0;
+    this.signaling = Promise.resolve(); // text messages, handled strictly one after another
+
+    // What the capture client says it is doing, and how this window's requests to it went.
+    this.state = null;
+    this.lastSelection = '';  // the last select message sent, as JSON
+    this.audioPending = null; // {ids, request, until}: an audio device change sent but not yet confirmed
+    this.audioError = null;   // why the last audio device change was refused
+    this.controlError = null; // why the last other command or setting was refused
+
+    /** H.264 mode: the WebRTC connection; see acceptOffer and closePeer. */
+    this.rtc = Session.noRtc();
+
+    /** JPEG mode: pictures and PCM audio over the WebSocket; see handleMedia and closeSocketMedia. */
+    this.media = Session.noMedia();
+
+    // Statistics: polled every second (pollStats).
+    this.statsTimer = 0;
+    this.rateMemory = {}; // the counters at the last poll, for rates
+    this.snapshot = { state: 'connecting' };
+  }
+
+  static noRtc() {
+    return {
+      peer: null,
+      earlyCandidates: [],      // candidates that arrived before their offer was set
+      tracks: new Map(),        // stream id -> video track
+      trackToSource: new Map(), // track id -> stream id
+      connectedAt: 0,
+    };
+  }
+
+  static noMedia() {
+    return {
+      pictures: new Map(), // stream id -> picture counters (Session.pictureCounters)
+      pcm: null,           // the PcmPlayer, once audio arrives
+      pcmCounters: { blocks: 0, samples: 0, bytes: 0, level: 0 },
+    };
+  }
+
+  static pictureCounters() {
+    return { decoding: false, pending: null, received: 0, shown: 0, skipped: 0, bytes: 0, width: 0, height: 0 };
+  }
 }
 
 function connect() {
@@ -572,44 +667,11 @@ function connect() {
   }
 
   disconnect();
-  if (!POPOUT_STREAM_ID) {
-    try {
-      localStorage.setItem(URL_STORAGE_KEY, url);
-    } catch {
-      // Storage can be unavailable (private window, file:// page); the address just is not remembered.
-    }
-  }
+  role.rememberAddress(url);
 
-  const s = {
-    url,
-    socket: null,
-    socketOpened: false,
-    openedAt: 0,
-    bytesReceived: 0,
-    state: null,
-    lastSelection: '',
-    audioPending: null,       // {ids, request, until}: an audio device change sent but not yet confirmed
-    audioError: null,         // why the last audio device change was refused
-    controlError: null,       // why the last other command or setting was refused
-    // WebRTC (h264 mode)
-    peer: null,
-    signaling: Promise.resolve(),
-    earlyCandidates: [],
-    tracks: new Map(),        // stream id -> video track
-    trackToSource: new Map(), // track id -> stream id
-    peerConnectedAt: 0,
-    // WebSocket media (jpeg mode)
-    pictures: new Map(),      // stream id -> counters
-    pcm: null,
-    pcmCounters: { blocks: 0, samples: 0, bytes: 0, level: 0 }, // PCM received (JPEG mode)
-    statsTimer: 0,
-    rateMemory: {},           // the counters at the last statistics poll, for rates
-    snapshot: { state: 'connecting' },
-  };
-
+  const s = new Session(url);
   try {
-    // A pop-out asks for its one stream and no audio as it connects, so it is never sent anything else.
-    s.socket = new WebSocket(POPOUT_STREAM_ID ? addressFor(url, POPOUT_STREAM_ID) : url);
+    s.socket = new WebSocket(role.socketAddress(url));
   } catch (error) {
     setStatus('error', `That address cannot be used: ${error.message}`);
     return;
@@ -704,10 +766,10 @@ async function handleMessage(s, data) {
         await acceptOffer(s, message);
       }
     } else if (message.candidate) {
-      if (s.peer?.remoteDescription) {
-        await s.peer.addIceCandidate(message);
+      if (s.rtc.peer?.remoteDescription) {
+        await s.rtc.peer.addIceCandidate(message);
       } else {
-        s.earlyCandidates.push(message); // a candidate cannot be applied before the offer it belongs to
+        s.rtc.earlyCandidates.push(message); // a candidate cannot be applied before the offer it belongs to
       }
     }
   } catch (error) {
@@ -762,10 +824,10 @@ function refreshStatus(s) {
   } else if (state.streaming.state === 'paused') {
     setStatus('idle', 'Connected · streaming is paused');
   } else if (state.video.mode === 'jpeg') {
-    const live = [...s.pictures.values()].some((counters) => counters.shown > 0);
+    const live = [...s.media.pictures.values()].some((counters) => counters.shown > 0);
     setStatus(live ? 'live' : 'connecting', live ? 'Live · JPEG' : 'Waiting for pictures…');
   } else {
-    const connected = s.peer?.connectionState === 'connected';
+    const connected = s.rtc.peer?.connectionState === 'connected';
     setStatus(connected ? 'live' : 'connecting', connected ? 'Live · H.264' : 'Starting the stream…');
   }
 }
@@ -832,10 +894,7 @@ function applyState(s, state) {
     closeSocketMedia(s);
   }
 
-  if (POPOUT_STREAM_ID) {
-    const source = state.sources.find((candidate) => candidate.id === POPOUT_STREAM_ID);
-    document.title = `${source?.name ?? POPOUT_STREAM_ID} – Capture Viewer`;
-  }
+  document.title = role.titleFor(state) ?? document.title;
 
   render();
   syncSelection();
@@ -1079,26 +1138,26 @@ async function acceptOffer(s, offer) {
   closePeer(s);
 
   const peer = new RTCPeerConnection();
-  s.peer = peer;
-  s.peerConnectedAt = 0;
+  s.rtc.peer = peer;
+  s.rtc.connectedAt = 0;
   s.rateMemory = {};
   const sourceByMid = new Map(Object.entries(offer.sources ?? {}));
   log(`Offer received (${sourceByMid.size} video stream${sourceByMid.size === 1 ? '' : 's'}${/^m=audio/m.test(offer.sdp) ? ' and audio' : ''})`);
 
   peer.onicecandidate = (event) => {
-    if (event.candidate && s.peer === peer) {
+    if (event.candidate && s.rtc.peer === peer) {
       send(event.candidate);
     }
   };
 
   peer.onconnectionstatechange = () => {
-    if (s.peer !== peer) {
+    if (s.rtc.peer !== peer) {
       return;
     }
     const state = peer.connectionState;
     log(`WebRTC ${state}`, state === 'connected' ? 'good' : state === 'failed' ? 'error' : 'info');
     if (state === 'connected') {
-      s.peerConnectedAt = performance.now();
+      s.rtc.connectedAt = performance.now();
     }
     refreshStatus(s);
   };
@@ -1110,13 +1169,13 @@ async function acceptOffer(s, offer) {
   for (const transceiver of peer.getTransceivers()) {
     const track = transceiver.receiver.track;
     if (track.kind === 'audio') {
-      if (!POPOUT_STREAM_ID) {
+      if (role.playsAudio) {
         playAudio(track);
       }
     } else if (sourceByMid.has(transceiver.mid)) {
       const id = sourceByMid.get(transceiver.mid);
-      s.tracks.set(id, track);
-      s.trackToSource.set(track.id, id);
+      s.rtc.tracks.set(id, track);
+      s.rtc.trackToSource.set(track.id, id);
     }
     // A live view: ask for the smallest receive buffer the network allows.
     if ('jitterBufferTarget' in transceiver.receiver) {
@@ -1125,24 +1184,21 @@ async function acceptOffer(s, offer) {
   }
   render(); // the tiles get their tracks
 
-  for (const candidate of s.earlyCandidates.splice(0)) {
+  for (const candidate of s.rtc.earlyCandidates.splice(0)) {
     await peer.addIceCandidate(candidate);
   }
   await peer.setLocalDescription(await peer.createAnswer());
-  if (s.peer === peer) {
+  if (s.rtc.peer === peer) {
     send(peer.localDescription);
   }
 }
 
 function closePeer(s) {
-  if (!s.peer) {
+  if (!s.rtc.peer) {
     return;
   }
-  s.peer.close();
-  s.peer = null;
-  s.earlyCandidates = [];
-  s.tracks.clear();
-  s.trackToSource.clear();
+  s.rtc.peer.close();
+  s.rtc = Session.noRtc();
   el.webrtcAudio.srcObject = null;
   for (const tile of tiles.values()) {
     tile.attach(null);
@@ -1178,15 +1234,15 @@ function handleMedia(s, buffer) {
     if (!source) {
       return; // a stream from before a layout change
     }
-    let counters = s.pictures.get(source.id);
+    let counters = s.media.pictures.get(source.id);
     if (!counters) {
-      counters = newPictureCounters();
-      s.pictures.set(source.id, counters);
+      counters = Session.pictureCounters();
+      s.media.pictures.set(source.id, counters);
     }
     counters.received++;
     counters.bytes += message.payload.byteLength;
     showPicture(s, source.id, counters, message.payload);
-  } else if (message.type === AUDIO_MESSAGE && !POPOUT_STREAM_ID) {
+  } else if (message.type === AUDIO_MESSAGE && role.playsAudio) {
     playPcm(s, pcmSamples(message.payload));
   }
 }
@@ -1228,33 +1284,31 @@ async function showPicture(s, id, counters, jpeg) {
 }
 
 function playPcm(s, samples) {
-  if (!s.pcm) {
-    s.pcm = new PcmPlayer(s.state.audio.sampleRate, muted);
-    el.unmute.hidden = !s.pcm.suspended;
+  if (!s.media.pcm) {
+    s.media.pcm = new PcmPlayer(s.state.audio.sampleRate, muted);
+    el.unmute.hidden = !s.media.pcm.suspended;
   }
 
-  s.pcmCounters.blocks++;
-  s.pcmCounters.samples += samples.length;
-  s.pcmCounters.bytes += samples.byteLength;
+  s.media.pcmCounters.blocks++;
+  s.media.pcmCounters.samples += samples.length;
+  s.media.pcmCounters.bytes += samples.byteLength;
 
   let peak = 0;
   for (let i = 0; i < samples.length; i++) {
     peak = Math.max(peak, Math.abs(samples[i]));
   }
-  s.pcmCounters.level = Math.max(peak / 32768, s.pcmCounters.level * 0.8);
+  s.media.pcmCounters.level = Math.max(peak / 32768, s.media.pcmCounters.level * 0.8);
 
-  s.pcm.play(samples);
+  s.media.pcm.play(samples);
 }
 
 function closeSocketMedia(s) {
-  if (!s.pcm && s.pictures.size === 0 && s.pcmCounters.blocks === 0) {
+  if (!s.media.pcm && s.media.pictures.size === 0 && s.media.pcmCounters.blocks === 0) {
     return; // nothing was open
   }
 
-  s.pcm?.close();
-  s.pcm = null;
-  s.pictures = new Map();
-  s.pcmCounters = { blocks: 0, samples: 0, bytes: 0, level: 0 };
+  s.media.pcm?.close();
+  s.media = Session.noMedia();
   s.rateMemory = {};
   for (const tile of tiles.values()) {
     tile.clearPicture();
@@ -1327,6 +1381,40 @@ function showTileInfo(perSource) {
 }
 
 /**
+ * What one statistics poll found, whichever way the media came: each source of statistics below
+ * (measureControlOnly, measureSocketMedia, measurePeer) fills one of these, and pollStats shows it.
+ * @typedef {object} Measurements
+ * @property {Object<string, StreamStats>} sources   by stream id
+ * @property {AudioStats|null} audio
+ * @property {number} level              the audio level, 0 to 1
+ * @property {ConnectionStats} connection
+ * @property {string} [state]            the WebRTC connection's state, when there is one
+ *
+ * @typedef {object} StreamStats
+ * @property {number} width
+ * @property {number} height
+ * @property {number} framesPerSecond
+ * @property {number} bitsPerSecond
+ * @property {string} codec              'JPEG', or the WebRTC codec ('H.264 Constrained Baseline')
+ * @property {number} framesDecoded      pictures shown
+ * @property {number} framesDropped
+ *
+ * @typedef {object} AudioStats
+ * @property {string} codec
+ * @property {number} bitsPerSecond
+ * @property {number} packetsReceived
+ * @property {number} [packetsLost]      WebRTC only
+ * @property {number} [bufferedSeconds]
+ *
+ * @typedef {object} ConnectionStats
+ * @property {string} transport
+ * @property {string} [route]
+ * @property {number} [roundTripSeconds]
+ * @property {number} [bytesReceived]
+ * @property {number} [connectedAt]      performance.now() when the connection came up
+ */
+
+/**
  * What the last statistics poll found. The panels show it, and the end-to-end test
  * (tests/EndToEnd.ps1) reads it through window.captureViewer.stats, so these names are a contract.
  * @typedef {object} StatsSnapshot
@@ -1340,16 +1428,7 @@ function showTileInfo(perSource) {
  * @property {Object<string, number>} zoom   each tile's zoom, by stream id
  * @property {Object<string, StreamStats>} sources   by stream id
  * @property {object|null} video         totals over this window's tiles: streams, codec, framesPerSecond, bitsPerSecond, framesDecoded, ...
- * @property {object|null} audio         codec, bitsPerSecond, packetsReceived, ...; null in a pop-out
- *
- * @typedef {object} StreamStats
- * @property {number} width
- * @property {number} height
- * @property {number} framesPerSecond
- * @property {number} bitsPerSecond
- * @property {string} codec              'JPEG', or the WebRTC codec ('H.264 Constrained Baseline')
- * @property {number} framesDecoded      pictures shown
- * @property {number} framesDropped
+ * @property {AudioStats|null} audio     null in a pop-out
  */
 
 async function pollStats(s) {
@@ -1358,50 +1437,73 @@ async function pollStats(s) {
   }
 
   const state = s.state;
-  const mode = state?.video.mode;
-  const streaming = state?.streaming.state;
+  const jpeg = state !== null && state.streaming.state !== 'stopped' && state.video.mode === 'jpeg';
+  const found = jpeg ? measureSocketMedia(s) : s.rtc.peer ? await measurePeer(s) : measureControlOnly(s);
+  if (session !== s || !found) {
+    return; // a newer connection, or the WebRTC connection went away while it was asked
+  }
+
+  const video = summarizeVideo(found.sources);
+  showVideoSummary(video);
+  showTileInfo(found.sources);
+  showAudioStats(found.audio);
+  el.level.value = found.level;
+  showConnectionStats(found.connection);
+
   /** @type {StatsSnapshot} */
-  const snapshot = {
-    state: s.socketOpened ? 'connected' : 'connecting',
-    mode: mode ?? null,
-    streaming: streaming ?? null,
+  s.snapshot = {
+    state: found.state ?? (s.socketOpened ? 'connected' : 'connecting'),
+    mode: state?.video.mode ?? null,
+    streaming: state?.streaming.state ?? null,
     recording: state?.recording.state ?? null,
     layout: state?.layout ?? null,
     tiles: [...tiles.keys()],
     popouts: [...popouts.keys()],
     zoom: Object.fromEntries([...tiles].map(([id, tile]) => [id, Math.round(tile.zoom.scale * 100) / 100])),
-    sources: {},
-    video: null,
-    audio: null,
+    sources: found.sources,
+    video,
+    audio: found.audio,
   };
-
-  if (streaming && streaming !== 'stopped' && mode === 'jpeg') {
-    pollPictureStats(s, snapshot);
-  } else if (s.peer) {
-    await pollPeerStats(s, snapshot);
-  } else {
-    showStats('video', null);
-    showStats('audio', null);
-    showTileInfo({});
-    el.level.value = 0;
-    showStats('connection', {
-      'Transport': s.socketOpened ? 'WebSocket (control only)' : EMPTY,
-      'Received': formatBytes(s.bytesReceived),
-      'Connected for': s.openedAt ? formatDuration(performance.now() - s.openedAt) : EMPTY,
-    });
-  }
-
-  if (session === s) {
-    s.snapshot = snapshot;
-  }
 }
 
-function pollPictureStats(s, snapshot) {
+function showAudioStats(audio) {
+  showStats('audio', audio && {
+    'Codec': audio.codec,
+    'Bit rate': formatBitRate(audio.bitsPerSecond),
+    'Packets received': formatCount(audio.packetsReceived),
+    'Packets lost': formatCount(audio.packetsLost),
+    'Buffered': formatMilliseconds(audio.bufferedSeconds),
+  });
+}
+
+function showConnectionStats(connection) {
+  showStats('connection', {
+    'Transport': connection.transport,
+    'Route': connection.route ?? EMPTY,
+    'Round trip': formatMilliseconds(connection.roundTripSeconds),
+    'Received': formatBytes(connection.bytesReceived),
+    'Connected for': connection.connectedAt ? formatDuration(performance.now() - connection.connectedAt) : EMPTY,
+  });
+}
+
+/** Nothing is streaming to this window: there is only the WebSocket, for control. */
+function measureControlOnly(s) {
+  return {
+    sources: {},
+    audio: null,
+    level: 0,
+    connection: { transport: s.socketOpened ? 'WebSocket (control only)' : EMPTY, bytesReceived: s.bytesReceived, connectedAt: s.openedAt },
+  };
+}
+
+/** JPEG mode: the pictures and PCM audio counted as they arrived over the WebSocket. */
+function measureSocketMedia(s) {
   const now = performance.now();
-  for (const [id, counters] of s.pictures) {
+  const sources = {};
+  for (const [id, counters] of s.media.pictures) {
     const frameRate = rateOf(s, `pictures:${id}`, counters.shown, now);
     const bits = rateOf(s, `pictureBits:${id}`, counters.bytes * 8, now);
-    snapshot.sources[id] = {
+    sources[id] = {
       width: counters.width,
       height: counters.height,
       framesPerSecond: Math.round((frameRate ?? 0) * 10) / 10,
@@ -1412,49 +1514,40 @@ function pollPictureStats(s, snapshot) {
       framesReceived: counters.received,
     };
   }
-  snapshot.video = summarizeVideo(snapshot.sources);
-  showVideoSummary(snapshot.video);
-  showTileInfo(snapshot.sources);
 
-  const audioBits = rateOf(s, 'audioBits', s.pcmCounters.bytes * 8, now);
-  showStats('audio', s.pcmCounters.blocks === 0 ? null : {
-    'Codec': 'PCM 16-bit, 8 kHz',
-    'Bit rate': formatBitRate(audioBits),
-    'Packets received': formatCount(s.pcmCounters.blocks),
-    'Buffered': s.pcm ? formatMilliseconds(s.pcm.buffered) : EMPTY,
-  });
-  el.level.value = s.pcmCounters.level;
-  s.pcmCounters.level *= 0.5;
+  const { pcm, pcmCounters } = s.media;
+  const audioBits = rateOf(s, 'audioBits', pcmCounters.bytes * 8, now);
+  const audio = pcmCounters.blocks === 0 ? null : {
+    codec: 'PCM 16-bit, 8 kHz',
+    bitsPerSecond: Math.round(audioBits ?? 0),
+    packetsReceived: pcmCounters.blocks,
+    totalSamplesReceived: pcmCounters.samples,
+    bufferedSeconds: pcm ? Math.round(pcm.buffered * 1000) / 1000 : 0,
+    contextState: pcm?.context.state ?? null,
+  };
 
-  showStats('connection', {
-    'Transport': 'WebSocket',
-    'Route': s.url,
-    'Received': formatBytes(s.bytesReceived),
-    'Connected for': formatDuration(now - s.openedAt),
-  });
+  const level = pcmCounters.level;
+  pcmCounters.level *= 0.5; // dies away unless new audio raises it
 
-  if (s.pcmCounters.blocks > 0) {
-    snapshot.audio = {
-      codec: 'PCM 16-bit, 8 kHz',
-      bitsPerSecond: Math.round(audioBits ?? 0),
-      packetsReceived: s.pcmCounters.blocks,
-      totalSamplesReceived: s.pcmCounters.samples,
-      bufferedSeconds: s.pcm ? Math.round(s.pcm.buffered * 1000) / 1000 : 0,
-      contextState: s.pcm?.context.state ?? null,
-    };
-  }
+  return {
+    sources,
+    audio,
+    level,
+    connection: { transport: 'WebSocket', route: s.url, bytesReceived: s.bytesReceived, connectedAt: s.openedAt },
+  };
 }
 
-async function pollPeerStats(s, snapshot) {
-  const peer = s.peer;
+/** H.264 mode: the WebRTC connection's own statistics. Null if the connection goes away meanwhile. */
+async function measurePeer(s) {
+  const peer = s.rtc.peer;
   let report;
   try {
     report = await peer.getStats();
   } catch {
-    return;
+    return null;
   }
-  if (session !== s || s.peer !== peer) {
-    return;
+  if (session !== s || s.rtc.peer !== peer) {
+    return null;
   }
 
   const stats = new Map();
@@ -1477,13 +1570,14 @@ async function pollPeerStats(s, snapshot) {
     }
   });
 
+  const sources = {};
   for (const video of videos) {
-    const id = s.trackToSource.get(video.trackIdentifier);
+    const id = s.rtc.trackToSource.get(video.trackIdentifier);
     if (!id) {
       continue;
     }
     const bitRate = rateOf(s, `video:${id}`, video.bytesReceived * 8, video.timestamp);
-    snapshot.sources[id] = {
+    sources[id] = {
       width: video.frameWidth ?? 0,
       height: video.frameHeight ?? 0,
       framesPerSecond: video.framesPerSecond ?? 0,
@@ -1497,43 +1591,35 @@ async function pollPeerStats(s, snapshot) {
       jitterMs: Math.round((video.jitter ?? 0) * 1000),
     };
   }
-  snapshot.video = summarizeVideo(snapshot.sources);
-  showVideoSummary(snapshot.video);
-  showTileInfo(snapshot.sources);
 
-  if (audio && !POPOUT_STREAM_ID) {
+  let audioStats = null;
+  if (audio && role.playsAudio) {
     const bitRate = rateOf(s, 'audio', audio.bytesReceived * 8, audio.timestamp);
-    const codec = describeCodec(stats.get(audio.codecId));
-    showStats('audio', {
-      'Codec': codec,
-      'Bit rate': formatBitRate(bitRate),
-      'Packets received': formatCount(audio.packetsReceived),
-      'Packets lost': formatCount(audio.packetsLost),
-      'Buffered': audio.jitterBufferEmittedCount ? formatMilliseconds(audio.jitterBufferDelay / audio.jitterBufferEmittedCount) : EMPTY,
-    });
-    el.level.value = audio.audioLevel ?? 0;
-    snapshot.audio = {
-      codec,
+    audioStats = {
+      codec: describeCodec(stats.get(audio.codecId)),
       bitsPerSecond: Math.round(bitRate ?? 0),
       packetsReceived: audio.packetsReceived ?? 0,
       packetsLost: audio.packetsLost ?? 0,
+      bufferedSeconds: audio.jitterBufferEmittedCount ? audio.jitterBufferDelay / audio.jitterBufferEmittedCount : undefined,
       totalSamplesReceived: audio.totalSamplesReceived ?? 0,
       jitterMs: Math.round((audio.jitter ?? 0) * 1000),
       audioLevel: audio.audioLevel ?? 0,
     };
-  } else {
-    showStats('audio', null);
   }
 
-  showStats('connection', {
-    'Transport': `WebRTC (${peer.connectionState})`,
-    'Route': pair ? `${describeCandidate(stats.get(pair.localCandidateId))} → ${describeCandidate(stats.get(pair.remoteCandidateId))}` : EMPTY,
-    'Round trip': formatMilliseconds(pair?.currentRoundTripTime),
-    'Received': formatBytes(pair?.bytesReceived),
-    'Connected for': s.peerConnectedAt ? formatDuration(performance.now() - s.peerConnectedAt) : EMPTY,
-  });
-
-  snapshot.state = peer.connectionState;
+  return {
+    state: peer.connectionState,
+    sources,
+    audio: audioStats,
+    level: audioStats?.audioLevel ?? 0,
+    connection: {
+      transport: `WebRTC (${peer.connectionState})`,
+      route: pair ? `${describeCandidate(stats.get(pair.localCandidateId))} → ${describeCandidate(stats.get(pair.remoteCandidateId))}` : undefined,
+      roundTripSeconds: pair?.currentRoundTripTime,
+      bytesReceived: pair?.bytesReceived,
+      connectedAt: s.rtc.connectedAt,
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1575,9 +1661,9 @@ el.frameRate.addEventListener('change', () => {
 function setMuted(value) {
   muted = value;
   el.webrtcAudio.muted = value;
-  session?.pcm?.setMuted(value);
+  session?.media.pcm?.setMuted(value);
   if (!value) {
-    session?.pcm?.resume();
+    session?.media.pcm?.resume();
     if (el.webrtcAudio.srcObject) {
       el.webrtcAudio.play().catch(() => {});
     }
@@ -1606,24 +1692,15 @@ window.captureViewer = {
   },
 };
 
-if (POPOUT_STREAM_ID) {
-  document.body.classList.add('popout');
-  document.title = `${POPOUT_STREAM_ID} – Capture Viewer`;
-}
+// A pop-out shows nothing but its stream.
+document.body.classList.toggle('popout', !role.hasControls);
+document.title = role.titleFor(null) ?? document.title;
 
 buildStatPanels();
 render();
 
 // ?url=ws://host:port/ presets the address; ?autoconnect connects on load.
-let initialUrl = parameters.get('url');
-if (!initialUrl && !POPOUT_STREAM_ID) {
-  try {
-    initialUrl = localStorage.getItem(URL_STORAGE_KEY);
-  } catch {
-    initialUrl = null;
-  }
-}
-el.url.value = initialUrl || DEFAULT_URL;
+el.url.value = parameters.get('url') || role.savedAddress() || DEFAULT_URL;
 
 if (parameters.has('autoconnect')) {
   connect();
