@@ -63,7 +63,8 @@ internal sealed class CaptureArea
     public static CaptureArea ForDesktop(IReadOnlyList<DisplayInfo> displays) =>
         new(DesktopId, 0, "Desktop", displays);
 
-    public static IReadOnlyList<CaptureArea> For(ScreenLayout layout, IReadOnlyList<DisplayInfo> displays) =>
+    /// <summary>The streams a layout makes of the screens: one per screen, or one for the desktop.</summary>
+    public static IReadOnlyList<CaptureArea> ForLayout(ScreenLayout layout, IReadOnlyList<DisplayInfo> displays) =>
         layout == ScreenLayout.Desktop ? [ForDesktop(displays)] : displays.Select(ForScreen).ToList();
 
     public override string ToString() => $"{Name} ({Width}x{Height} at {Left},{Top})";

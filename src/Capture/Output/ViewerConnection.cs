@@ -65,6 +65,8 @@ internal sealed class ViewerConnection
 
     public string Name => _socket.RemoteEndPoint;
 
+    // Who receives what: these three decide both what the capture client has to produce (the
+    // server's demand queries) and what is sent to this viewer (the Send and Queue methods below).
     public bool ReceivesAudio => MediaFlowing && _wantsAudio;
 
     public bool ReceivesAnything => MediaFlowing && (_wantsAudio || _server.Sources.Any(source => IsSelected(source.Id)));
@@ -98,7 +100,7 @@ internal sealed class ViewerConnection
     /// <summary>Offers a picture. Only the newest one of each stream waits: a slow viewer gets fewer pictures, not older ones.</summary>
     public void QueuePicture(StreamSource source, byte[] message)
     {
-        if (IsSelected(source.Id))
+        if (Receives(source.Id))
         {
             _pictures[source.Number] = message;
             _sendPending.Set();
@@ -107,7 +109,7 @@ internal sealed class ViewerConnection
 
     public void QueueAudio(byte[] message)
     {
-        if (!_wantsAudio)
+        if (!ReceivesAudio)
         {
             return;
         }
@@ -123,7 +125,7 @@ internal sealed class ViewerConnection
 
     public void SendVideo(string sourceId, EncodedVideoFrame frame)
     {
-        if (IsSelected(sourceId))
+        if (Receives(sourceId))
         {
             _peer?.SendVideo(sourceId, frame);
         }
@@ -131,7 +133,7 @@ internal sealed class ViewerConnection
 
     public void SendAudio(byte[] muLaw, long captureTime)
     {
-        if (_wantsAudio)
+        if (ReceivesAudio)
         {
             _peer?.SendAudio(muLaw, captureTime);
         }

@@ -9,10 +9,8 @@ namespace Capture.Interop;
 /// </summary>
 internal static unsafe class Direct3D
 {
-    public const int DXGI_ERROR_NOT_FOUND = unchecked((int)0x887A0002);
     public const int DXGI_ERROR_UNSUPPORTED = unchecked((int)0x887A0004);
     public const int DXGI_ERROR_NOT_CURRENTLY_AVAILABLE = unchecked((int)0x887A0022);
-    public const int DXGI_ERROR_ACCESS_LOST = unchecked((int)0x887A0026);
     public const int DXGI_ERROR_WAIT_TIMEOUT = unchecked((int)0x887A0027);
     public const int E_ACCESSDENIED = unchecked((int)0x80070005);
 

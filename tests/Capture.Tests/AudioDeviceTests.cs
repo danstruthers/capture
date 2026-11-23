@@ -67,15 +67,16 @@ public sealed class AudioDeviceTests
         string[] selection = [.. devices.Select(device => device.Id), AudioSelection.DefaultInput, AudioSelection.DefaultOutput];
         selection = [.. selection.Where(entry => AudioSelection.KindOfDefault(entry) is not { } kind || devices.Any(device => device.Kind == kind))];
 
-        using var mixer = new AudioMixer(new MediaClock(), AudioDevices.System, selection);
+        var clock = new MediaClock();
+        using var mixer = new AudioMixer(clock, new AudioDeviceSupervisor(clock, AudioDevices.System, selection));
         mixer.Start();
         mixer.SetActive(true);
 
         // They open in the background, side by side; some take seconds to wake up.
-        Assert.True(mixer.WaitUntilSettled(TimeSpan.FromSeconds(20)), "the devices are still opening after 20 s");
-        IReadOnlyList<AudioInputStatus> inputs = mixer.GetInputs();
+        Assert.True(mixer.Devices.WaitUntilSettled(TimeSpan.FromSeconds(20)), "the devices are still opening after 20 s");
+        IReadOnlyList<AudioEntryStatus> inputs = mixer.Devices.GetEntries();
         Assert.Equal(selection.Length, inputs.Count);
-        Assert.All(inputs, input => Assert.True(input.State == AudioInputState.Capturing, $"{input.Device?.Name ?? input.Id}: {input.State} {input.Problem}"));
+        Assert.All(inputs, input => Assert.True(input.State == AudioEntryState.Capturing, $"{input.Device?.Name ?? input.Id}: {input.State} {input.Problem}"));
         Assert.All(inputs, input => Assert.Matches(@"^\d+ Hz, \d+ ch, \d+-bit (float|PCM)$", input.Format));
 
         // The default entries share their devices' sources: every device is in the mix once.
@@ -90,7 +91,7 @@ public sealed class AudioDeviceTests
         Assert.True(mixer.FramesProduced >= 25, $"only {mixer.FramesProduced} frames in 3 s");
 
         mixer.SetActive(false);
-        Assert.All(mixer.GetInputs(), input => Assert.Equal(AudioInputState.Idle, input.State));
-        Assert.True(mixer.WaitUntilSettled(TimeSpan.FromSeconds(10)), "the devices are still closing after 10 s");
+        Assert.All(mixer.Devices.GetEntries(), input => Assert.Equal(AudioEntryState.Idle, input.State));
+        Assert.True(mixer.Devices.WaitUntilSettled(TimeSpan.FromSeconds(10)), "the devices are still closing after 10 s");
     }
 }

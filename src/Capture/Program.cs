@@ -54,7 +54,25 @@ internal static class Program
                 return 0;
             }
 
-            return Run(options);
+            // Looked up before anything starts, so that naming a screen or audio device that is not
+            // there is reported like any other mistake in the options.
+            IReadOnlyList<DisplayInfo> screens;
+            string[] audioSelection;
+            try
+            {
+                screens = DisplayInfo.Select(options.Screens);
+                audioSelection = options.Audio
+                    ? AudioSelection.FromOptions(options.AudioSource, options.AudioDeviceSelectors.Select(AudioDevices.Find))
+                    : [];
+            }
+            catch (ArgumentException ex)
+            {
+                Console.Error.WriteLine($"capture: {ex.Message}");
+                Console.Error.WriteLine("Run 'capture --list-devices' to see the screens and audio devices.");
+                return 2;
+            }
+
+            return Run(options, screens, audioSelection);
         }
         catch (Exception ex)
         {
@@ -68,7 +86,7 @@ internal static class Program
         }
     }
 
-    private static int Run(Options options)
+    private static int Run(Options options, IReadOnlyList<DisplayInfo> screens, string[] audioSelection)
     {
         using var stopRequested = new ManualResetEventSlim(false);
         using var finished = new ManualResetEventSlim(false);
@@ -97,7 +115,7 @@ internal static class Program
 
         try
         {
-            using var session = new CaptureSession(options);
+            using var session = new CaptureSession(options, screens, audioSelection);
             session.Faulted += _ => stopRequested.Set();
             session.Start();
 

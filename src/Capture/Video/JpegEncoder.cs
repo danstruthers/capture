@@ -11,10 +11,6 @@ internal sealed class JpegFrame
     public required byte[] Data { get; init; }
 
     public required long Timestamp { get; init; }
-
-    public required int Width { get; init; }
-
-    public required int Height { get; init; }
 }
 
 /// <summary>
@@ -31,7 +27,7 @@ internal sealed class JpegEncoder : IDisposable
     private readonly EncoderParameters _parameters;
     private readonly MemoryStream _stream = new();
 
-    public JpegEncoder(int sourceWidth, int sourceHeight, int width, int height, int fps, int quality)
+    public JpegEncoder(int sourceWidth, int sourceHeight, int width, int height, int quality)
     {
         _width = width;
         _height = height;
@@ -41,7 +37,7 @@ internal sealed class JpegEncoder : IDisposable
 
         if (width != sourceWidth || height != sourceHeight)
         {
-            _scaler = new VideoConverter(sourceWidth, sourceHeight, width, height, fps, MFMediaType.RGB32, bt709: false);
+            _scaler = VideoConverter.Scaler(sourceWidth, sourceHeight, width, height);
         }
     }
 
@@ -73,7 +69,7 @@ internal sealed class JpegEncoder : IDisposable
                 Mf.Release(buffer);
             }
 
-            return new JpegFrame { Data = _stream.ToArray(), Timestamp = timestamp, Width = _width, Height = _height };
+            return new JpegFrame { Data = _stream.ToArray(), Timestamp = timestamp };
         }
         finally
         {

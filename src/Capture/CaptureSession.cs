@@ -52,7 +52,9 @@ internal sealed class CaptureSession : IRemoteControl, IDisposable
     private int _faulted;
     private volatile bool _disposed;
 
-    public CaptureSession(Options options)
+    /// <param name="screens">The screens to capture, as the options name them (<see cref="DisplayInfo.Select"/>).</param>
+    /// <param name="audioSelection">What to record audio from (<see cref="AudioSelection"/>), when audio is on.</param>
+    public CaptureSession(Options options, IReadOnlyList<DisplayInfo> screens, IReadOnlyList<string> audioSelection)
     {
         _options = options;
         _frameRate = options.Fps;
@@ -70,17 +72,16 @@ internal sealed class CaptureSession : IRemoteControl, IDisposable
             options.Capture,
             options.JpegQuality);
 
-        _displays = DisplayInfo.Select(options.Screens);
+        _displays = screens;
         VideoPipeline[] pipelines = CreatePipelines(_layout, _displays);
 
         try
         {
             if (options.Audio)
             {
-                // Looked up now, so that a device that does not exist is reported at once rather than when audio is first needed.
-                AudioDeviceInfo[] devices = [.. options.AudioDeviceSelectors.Select(AudioDevices.Find)];
-                _audio = new AudioMixer(_clock, AudioDevices.System, AudioSelection.FromOptions(options.AudioSource, devices));
-                Log.Info($"Audio: {DescribeAudioSelection(_audio)} -> 16-bit PCM, {PcmFormat.SampleRate} Hz, mono");
+                var supervisor = new AudioDeviceSupervisor(_clock, AudioDevices.System, audioSelection);
+                _audio = new AudioMixer(_clock, supervisor);
+                Log.Info($"Audio: {DescribeAudioSelection(supervisor)} -> 16-bit PCM, {PcmFormat.SampleRate} Hz, mono");
             }
             else
             {
@@ -104,7 +105,7 @@ internal sealed class CaptureSession : IRemoteControl, IDisposable
 
             if (_audio is not null)
             {
-                _audio.FrameCaptured += OnAudioFrame;
+                _audio.FrameMixed += OnAudioFrame;
             }
         }
         catch
@@ -334,9 +335,9 @@ internal sealed class CaptureSession : IRemoteControl, IDisposable
     }
 
     /// <summary>"the default recording device (Microphone (USB Audio)) + Speakers (Realtek(R) Audio)".</summary>
-    private static string DescribeAudioSelection(AudioMixer audio)
+    private static string DescribeAudioSelection(AudioDeviceSupervisor devices)
     {
-        IReadOnlyList<AudioInputStatus> inputs = audio.GetInputs();
+        IReadOnlyList<AudioEntryStatus> inputs = devices.GetEntries();
         return inputs.Count == 0
             ? "nothing (silence)"
             : string.Join(" + ", inputs.Select(input => AudioSelection.KindOfDefault(input.Id) is { } kind
@@ -361,7 +362,7 @@ internal sealed class CaptureSession : IRemoteControl, IDisposable
 
     private VideoPipeline[] CreatePipelines(ScreenLayout layout, IReadOnlyList<DisplayInfo> displays)
     {
-        IReadOnlyList<CaptureArea> areas = CaptureArea.For(layout, displays);
+        IReadOnlyList<CaptureArea> areas = CaptureArea.ForLayout(layout, displays);
         var created = new List<VideoPipeline>();
         try
         {
@@ -445,12 +446,12 @@ internal sealed class CaptureSession : IRemoteControl, IDisposable
 
     private void SetAudioSelection(IReadOnlyList<string> entries)
     {
-        AudioMixer audio = _audio ?? throw new RefusedException("Audio is turned off on the capture client (--no-audio).");
-        IReadOnlyList<string> before = audio.Selection;
-        audio.SetSelection(entries);
-        if (!audio.Selection.SequenceEqual(before))
+        AudioDeviceSupervisor devices = _audio?.Devices ?? throw new RefusedException("Audio is turned off on the capture client (--no-audio).");
+        IReadOnlyList<string> before = devices.Selection;
+        devices.SetSelection(entries);
+        if (!devices.Selection.SequenceEqual(before))
         {
-            Log.Info($"Audio is now recorded from {DescribeAudioSelection(audio)}.");
+            Log.Info($"Audio is now recorded from {DescribeAudioSelection(devices)}.");
         }
     }
 
@@ -462,14 +463,15 @@ internal sealed class CaptureSession : IRemoteControl, IDisposable
             return AudioInfo.Off;
         }
 
-        IReadOnlyList<string> selection = _audio.Selection;
+        AudioDeviceSupervisor devices = _audio.Devices;
+        IReadOnlyList<string> selection = devices.Selection;
         return new AudioInfo(
             Enabled: true,
             Source: AudioSelection.AsSource([.. selection])?.ToString().ToLowerInvariant() ?? "devices",
             Selected: selection,
-            Description: _audio.Description,
+            Description: devices.Description,
             SampleRate: PcmFormat.SampleRate,
-            Devices: AudioDeviceList.Build(_audio.GetInputs(), ConnectedAudioDevices()));
+            Devices: AudioDeviceList.Build(devices.GetEntries(), ConnectedAudioDevices()));
     }
 
     /// <summary>The connected audio devices, listed again at most every two seconds: the state goes out every second.</summary>

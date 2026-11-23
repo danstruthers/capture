@@ -168,6 +168,9 @@ internal sealed class StreamServer : IDisposable
         Changed?.Invoke();
     }
 
+    // What goes out over which transport is decided here, by the video mode; which viewer gets it,
+    // by each connection (ViewerConnection.Receives), with the same rules that decide the demand.
+
     public void SendVideo(string sourceId, EncodedVideoFrame frame)
     {
         if (State != StreamingState.Streaming || Mode != VideoMode.H264)

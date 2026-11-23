@@ -15,7 +15,7 @@ public class CaptureAreaTests
     [Fact]
     public void Separate_layout_makes_one_area_per_screen_named_by_screen_number()
     {
-        IReadOnlyList<CaptureArea> areas = CaptureArea.For(ScreenLayout.Separate, [Primary, Left]);
+        IReadOnlyList<CaptureArea> areas = CaptureArea.ForLayout(ScreenLayout.Separate, [Primary, Left]);
 
         Assert.Equal(["screen1", "screen2"], areas.Select(a => a.Id));
         Assert.Equal([1, 2], areas.Select(a => a.Number));
@@ -28,7 +28,7 @@ public class CaptureAreaTests
     [Fact]
     public void Desktop_layout_makes_one_area_covering_every_screen()
     {
-        CaptureArea desktop = Assert.Single(CaptureArea.For(ScreenLayout.Desktop, [Primary, Left]));
+        CaptureArea desktop = Assert.Single(CaptureArea.ForLayout(ScreenLayout.Desktop, [Primary, Left]));
 
         Assert.Equal(CaptureArea.DesktopId, desktop.Id);
         Assert.Equal(0, desktop.Number);

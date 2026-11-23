@@ -27,7 +27,7 @@ public class H264EncoderTests
             }
         };
 
-        using (var converter = new VideoConverter(TestFrames.Width, TestFrames.Height, TestFrames.Width, TestFrames.Height, TestFrames.Fps, MFMediaType.NV12, bt709: false))
+        using (var converter = VideoConverter.ToNv12(TestFrames.Width, TestFrames.Height, TestFrames.Width, TestFrames.Height, bt709: false))
         {
             for (int i = 0; i < count; i++)
             {
@@ -162,7 +162,7 @@ public class H264EncoderTests
     public void An_encoder_that_stops_producing_output_is_reported_as_failed()
     {
         using H264Encoder encoder = CreateSimulated(out _, producesOutput: false);
-        using var converter = new VideoConverter(TestFrames.Width, TestFrames.Height, TestFrames.Width, TestFrames.Height, TestFrames.Fps, MFMediaType.NV12, bt709: false);
+        using var converter = VideoConverter.ToNv12(TestFrames.Width, TestFrames.Height, TestFrames.Width, TestFrames.Height, bt709: false);
 
         IMFSample NextFrame(int i)
         {

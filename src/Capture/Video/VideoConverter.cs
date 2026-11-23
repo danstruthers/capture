@@ -11,12 +11,17 @@ namespace Capture.Video;
 /// </summary>
 internal sealed class VideoConverter : IDisposable
 {
+    // Frame-rate conversion is off (one frame out for each frame in), so the frame rate the media
+    // types carry is only nominal: the frames keep the times and durations they are given.
+    private const int NominalFps = 30;
+
     private readonly IMFTransform _processor;
     private readonly int _outputBufferSize;
     private bool _disposed;
 
     /// <param name="outputSubtype"><see cref="MFMediaType.NV12"/> or <see cref="MFMediaType.RGB32"/>.</param>
-    public VideoConverter(int inputWidth, int inputHeight, int outputWidth, int outputHeight, int fps, Guid outputSubtype, bool bt709)
+    /// <param name="bt709">For NV12: BT.709 colours rather than BT.601.</param>
+    private VideoConverter(int inputWidth, int inputHeight, int outputWidth, int outputHeight, Guid outputSubtype, bool bt709)
     {
         bool rgbOutput = outputSubtype == MFMediaType.RGB32;
         _processor = (IMFTransform)new VideoProcessorMFT();
@@ -25,19 +30,18 @@ internal sealed class VideoConverter : IDisposable
         {
             if (!Mf.Failed(_processor.GetAttributes(out IMFAttributes attributes)) && attributes is not null)
             {
-                // No frame-rate conversion: exactly one frame out for each frame in.
-                attributes.SetUINT32(MFAttributesClsid.MF_XVP_DISABLE_FRC, 1);
+                Mf.Check(attributes.SetUINT32(MFAttributesClsid.MF_XVP_DISABLE_FRC, 1), "Set MF_XVP_DISABLE_FRC");
                 Mf.Release(attributes);
             }
 
-            IMFMediaType inputType = Mf.CreateVideoType(MFMediaType.RGB32, inputWidth, inputHeight, fps);
+            IMFMediaType inputType = Mf.CreateVideoType(MFMediaType.RGB32, inputWidth, inputHeight, NominalFps);
             try
             {
                 // A positive stride tells the processor the rows are top-down, as the capturer produces them.
-                inputType.SetUINT32(MFAttributesClsid.MF_MT_DEFAULT_STRIDE, inputWidth * 4);
-                inputType.SetUINT32(MFAttributesClsid.MF_MT_ALL_SAMPLES_INDEPENDENT, 1);
-                inputType.SetUINT32(MFAttributesClsid.MF_MT_FIXED_SIZE_SAMPLES, 1);
-                inputType.SetUINT32(MFAttributesClsid.MF_MT_SAMPLE_SIZE, inputWidth * inputHeight * 4);
+                Mf.Check(inputType.SetUINT32(MFAttributesClsid.MF_MT_DEFAULT_STRIDE, inputWidth * 4), "Set MF_MT_DEFAULT_STRIDE");
+                Mf.Check(inputType.SetUINT32(MFAttributesClsid.MF_MT_ALL_SAMPLES_INDEPENDENT, 1), "Set MF_MT_ALL_SAMPLES_INDEPENDENT");
+                Mf.Check(inputType.SetUINT32(MFAttributesClsid.MF_MT_FIXED_SIZE_SAMPLES, 1), "Set MF_MT_FIXED_SIZE_SAMPLES");
+                Mf.Check(inputType.SetUINT32(MFAttributesClsid.MF_MT_SAMPLE_SIZE, inputWidth * inputHeight * 4), "Set MF_MT_SAMPLE_SIZE");
                 Mf.Check(_processor.SetInputType(0, inputType, MFTSetTypeFlags.None), "Video processor SetInputType(RGB32)");
             }
             finally
@@ -45,12 +49,12 @@ internal sealed class VideoConverter : IDisposable
                 Mf.Release(inputType);
             }
 
-            IMFMediaType outputType = Mf.CreateVideoType(outputSubtype, outputWidth, outputHeight, fps);
+            IMFMediaType outputType = Mf.CreateVideoType(outputSubtype, outputWidth, outputHeight, NominalFps);
             try
             {
                 if (rgbOutput)
                 {
-                    outputType.SetUINT32(MFAttributesClsid.MF_MT_DEFAULT_STRIDE, outputWidth * 4);
+                    Mf.Check(outputType.SetUINT32(MFAttributesClsid.MF_MT_DEFAULT_STRIDE, outputWidth * 4), "Set MF_MT_DEFAULT_STRIDE");
                 }
                 else
                 {
@@ -77,6 +81,15 @@ internal sealed class VideoConverter : IDisposable
             throw;
         }
     }
+
+    /// <summary>To NV12 of the given size, for the H.264 encoder.</summary>
+    /// <param name="bt709">BT.709 colours rather than BT.601; it has to match what the encoder is told.</param>
+    public static VideoConverter ToNv12(int inputWidth, int inputHeight, int outputWidth, int outputHeight, bool bt709) =>
+        new(inputWidth, inputHeight, outputWidth, outputHeight, MFMediaType.NV12, bt709);
+
+    /// <summary>To a BGRX picture of another size, for JPEG encoding.</summary>
+    public static VideoConverter Scaler(int inputWidth, int inputHeight, int outputWidth, int outputHeight) =>
+        new(inputWidth, inputHeight, outputWidth, outputHeight, MFMediaType.RGB32, bt709: false);
 
     /// <summary>Converts one frame. The caller keeps ownership of <paramref name="input"/> and owns the returned sample.</summary>
     public IMFSample Convert(IMFSample input, long timestamp, long duration)

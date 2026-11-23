@@ -5,29 +5,11 @@ using MediaFoundation.ReadWrite;
 
 namespace Capture.Audio;
 
-/// <summary>Something that records audio and places it, converted to <see cref="PcmFormat"/>, on a timeline.</summary>
-internal interface IAudioSource : IDisposable
-{
-    /// <summary>The device's name.</summary>
-    string Name { get; }
-
-    /// <summary>The format the device delivers, for display: "48000 Hz, 2 ch, 32-bit float".</summary>
-    string Format { get; }
-
-    /// <summary>How long after a moment its audio can be relied on to be on the timeline, in 100 ns units.</summary>
-    long Latency { get; }
-
-    AudioTimeline Timeline { get; }
-
-    /// <summary>Set if the source stopped by itself (device unplugged, format changed, ...).</summary>
-    Exception? Failure { get; }
-}
-
 /// <summary>
 /// Records from a recording device (microphone, line in) through a Media Foundation source reader
 /// and resamples to 8 kHz mono 16-bit PCM, whatever format the device itself runs at.
 /// </summary>
-internal sealed class MicrophoneSource : IAudioSource
+internal sealed class RecordingDeviceSource : IAudioSource
 {
     private const int AudioStream = (int)MF_SOURCE_READER.FirstAudioStream;
 
@@ -39,7 +21,7 @@ internal sealed class MicrophoneSource : IAudioSource
     private volatile bool _stopping;
     private bool _disposed;
 
-    public MicrophoneSource(AudioDeviceInfo device, MediaClock clock)
+    public RecordingDeviceSource(AudioDeviceInfo device, MediaClock clock)
     {
         // Device timestamps are on the Media Foundation system clock; this moves them to the session clock.
         _systemTimeOffset = MFExtern.MFGetSystemTime() - clock.Now;
@@ -75,7 +57,7 @@ internal sealed class MicrophoneSource : IAudioSource
             throw;
         }
 
-        _thread = new Thread(ReadLoop) { IsBackground = true, Name = "microphone-capture" };
+        _thread = new Thread(ReadLoop) { IsBackground = true, Name = "recording-device-capture" };
         _thread.SetApartmentState(ApartmentState.MTA);
         _thread.Start();
     }
@@ -126,7 +108,7 @@ internal sealed class MicrophoneSource : IAudioSource
         type.GetUINT32(MFAttributesClsid.MF_MT_AUDIO_NUM_CHANNELS, out int channels);
         type.GetUINT32(MFAttributesClsid.MF_MT_AUDIO_BITS_PER_SAMPLE, out int bits);
         string format = subtype == MFMediaType.Float ? "float" : subtype == MFMediaType.PCM ? "PCM" : subtype.ToString();
-        return $"{rate} Hz, {channels} ch, {bits}-bit {format}";
+        return PcmFormat.Describe(rate, channels, bits, format);
     }
 
     private void ReadLoop()
@@ -161,14 +143,7 @@ internal sealed class MicrophoneSource : IAudioSource
                         continue;
                     }
 
-                    // The resampler may hand its output back in several pieces; they follow one another in time.
-                    long captureTime = time - _systemTimeOffset;
-                    _resampler.Process(sample, pcm =>
-                    {
-                        ReadOnlySpan<short> samples = MemoryMarshal.Cast<byte, short>(pcm);
-                        Timeline.Write(captureTime, samples);
-                        captureTime += (long)samples.Length * MediaClock.TicksPerSecond / PcmFormat.SampleRate;
-                    });
+                    _resampler.Process(sample, Timeline.WriterFrom(time - _systemTimeOffset));
                 }
                 finally
                 {

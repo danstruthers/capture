@@ -25,7 +25,7 @@ public sealed class AudioDeviceListTests
     public void A_device_recorded_through_the_default_entry_shows_as_live_without_being_selected()
     {
         IReadOnlyList<AudioDeviceEntry> entries = AudioDeviceList.Build(
-            [new AudioInputStatus(AudioSelection.DefaultInput, Microphone, AudioInputState.Capturing, Format: "48000 Hz")],
+            [new AudioEntryStatus(AudioSelection.DefaultInput, Microphone, AudioEntryState.Capturing, Format: "48000 Hz")],
             [Microphone, Speakers]);
 
         AudioDeviceEntry standIn = entries.Single(entry => entry.Id == AudioSelection.DefaultInput);
@@ -40,7 +40,7 @@ public sealed class AudioDeviceListTests
         var headset = new AudioDeviceInfo("headset", "Headset", AudioDeviceKind.Output) { IsConnected = false };
 
         IReadOnlyList<AudioDeviceEntry> entries = AudioDeviceList.Build(
-            [new AudioInputStatus("headset", headset, AudioInputState.Unavailable, "not connected")],
+            [new AudioEntryStatus("headset", headset, AudioEntryState.Unavailable, "not connected")],
             [Microphone]);
 
         AudioDeviceEntry entry = entries.Single(entry => entry.Id == "headset");

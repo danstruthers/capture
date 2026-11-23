@@ -1,30 +1,6 @@
+using System.Runtime.InteropServices;
+
 namespace Capture.Audio;
-
-/// <summary>The audio format every part of the application works in: 16-bit linear PCM, 8 kHz, mono.</summary>
-internal static class PcmFormat
-{
-    public const int SampleRate = 8000;
-    public const int Channels = 1;
-
-    /// <summary>Samples in one 20 ms frame.</summary>
-    public const int SamplesPerFrame = SampleRate / 50;
-
-    /// <summary>Length of one frame in 100 ns units.</summary>
-    public const long FrameDuration = MediaClock.TicksPerSecond / 50;
-
-    public static long TimeToSample(long time) => time * SampleRate / MediaClock.TicksPerSecond;
-}
-
-/// <summary>20 ms of audio in <see cref="PcmFormat"/>.</summary>
-internal sealed class AudioFrame
-{
-    public required short[] Samples { get; init; }
-
-    /// <summary>Capture time of the first sample on the session clock (100 ns units).</summary>
-    public required long Timestamp { get; init; }
-
-    public long Duration => PcmFormat.FrameDuration;
-}
 
 /// <summary>
 /// The last few seconds of one source's audio, addressed by position on the session clock rather
@@ -77,6 +53,17 @@ internal sealed class AudioTimeline
             }
         }
     }
+
+    /// <summary>
+    /// Writes blocks of 16-bit PCM bytes captured from <paramref name="captureTime"/> on, each block
+    /// following the one before: a resampler can hand back one input's output in several pieces.
+    /// </summary>
+    public PcmHandler WriterFrom(long captureTime) => pcm =>
+    {
+        ReadOnlySpan<short> samples = MemoryMarshal.Cast<byte, short>(pcm);
+        Write(captureTime, samples);
+        captureTime += (long)samples.Length * MediaClock.TicksPerSecond / PcmFormat.SampleRate;
+    };
 
     /// <summary>Copies the samples at absolute positions [start, start + destination.Length); gaps are silence.</summary>
     public void Read(long start, Span<short> destination)

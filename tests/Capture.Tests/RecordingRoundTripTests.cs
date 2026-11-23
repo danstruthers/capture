@@ -348,7 +348,7 @@ public sealed class RecordingRoundTripTests : IDisposable
             public Stream(string id, Mp4Recorder recorder)
             {
                 Id = id;
-                _converter = new VideoConverter(TestFrames.Width, TestFrames.Height, TestFrames.Width, TestFrames.Height, TestFrames.Fps, MFMediaType.NV12, TestFrames.Config.Bt709);
+                _converter = VideoConverter.ToNv12(TestFrames.Width, TestFrames.Height, TestFrames.Width, TestFrames.Height, TestFrames.Config.Bt709);
                 Encoder = H264Encoders.CreateSoftware(TestFrames.Config);
                 Encoder.FrameEncoded += frame => recorder.WriteVideo(id, frame);
             }

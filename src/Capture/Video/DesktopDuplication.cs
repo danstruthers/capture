@@ -81,11 +81,9 @@ internal sealed unsafe class DesktopDuplication : IDisposable
         var duplication = new DesktopDuplication(display) { _heldScreen = display.DeviceName };
         try
         {
-            reason = duplication.Initialize() ?? string.Empty;
-            if (reason.Length == 0)
-            {
-                return duplication;
-            }
+            duplication.Initialize();
+            reason = string.Empty;
+            return duplication;
         }
         catch (Exception ex)
         {
@@ -209,8 +207,17 @@ internal sealed unsafe class DesktopDuplication : IDisposable
         _ => $"error 0x{hr:X8}",
     };
 
-    /// <summary>Returns null on success, otherwise why duplication cannot be used.</summary>
-    private string? Initialize()
+    /// <summary>Throws an <see cref="InvalidOperationException"/> if a Direct3D call failed, saying which (when <paramref name="what"/> is given) and why.</summary>
+    private static void Check(int hr, string? what = null)
+    {
+        if (hr < 0)
+        {
+            throw new InvalidOperationException(what is null ? Describe(hr) : $"{what} ({Describe(hr)})");
+        }
+    }
+
+    /// <summary>Sets duplication up. Throws <see cref="InvalidOperationException"/> saying why it cannot be used.</summary>
+    private void Initialize()
     {
         IntPtr adapter = IntPtr.Zero;
         IntPtr output = IntPtr.Zero;
@@ -218,39 +225,38 @@ internal sealed unsafe class DesktopDuplication : IDisposable
         {
             if (!FindOutput(_display.DeviceName, out adapter, out output))
             {
-                return "the monitor is not driven by a DXGI adapter";
+                throw new InvalidOperationException("the monitor is not driven by a DXGI adapter");
             }
 
             // The device has to live on the adapter that drives the monitor.
-            int hr = Direct3D.CreateDevice(adapter, out _device, out _context, out int featureLevel);
-            if (hr < 0)
-            {
-                return $"Direct3D 11 device creation failed ({Describe(hr)})";
-            }
+            Check(Direct3D.CreateDevice(adapter, out _device, out _context, out int featureLevel), "Direct3D 11 device creation failed");
 
             if (Direct3D.GetOutputColorSpace(output, out int colorSpace) >= 0 && colorSpace == Direct3D.DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020)
             {
-                HdrProblem = StartHdrDuplication(output, featureLevel);
+                try
+                {
+                    StartHdrDuplication(output, featureLevel);
+                }
+                catch (Exception ex) when (ex is InvalidOperationException or DllNotFoundException or EntryPointNotFoundException)
+                {
+                    HdrProblem = ex.Message; // falls back to the 8-bit image, below
+                }
             }
 
             if (_duplication == IntPtr.Zero)
             {
-                hr = Direct3D.DuplicateOutput(output, _device, out _duplication);
-                if (hr < 0)
-                {
-                    return Describe(hr);
-                }
+                Check(Direct3D.DuplicateOutput(output, _device, out _duplication));
             }
 
             Direct3D.GetDuplicationDesc(_duplication, out Direct3D.DXGI_OUTDUPL_DESC desc);
             if (desc.Rotation is not (Direct3D.DXGI_MODE_ROTATION_IDENTITY or Direct3D.DXGI_MODE_ROTATION_UNSPECIFIED))
             {
-                return "the monitor is rotated";
+                throw new InvalidOperationException("the monitor is rotated");
             }
 
             if (desc.Width != _width || desc.Height != _height)
             {
-                return $"unexpected surface size {desc.Width}x{desc.Height}";
+                throw new InvalidOperationException($"unexpected surface size {desc.Width}x{desc.Height}");
             }
 
             // The converter writes RGBA-ordered textures holding BGRA bytes; a straight copy is BGRA.
@@ -266,8 +272,7 @@ internal sealed unsafe class DesktopDuplication : IDisposable
                 CPUAccessFlags = Direct3D.D3D11_CPU_ACCESS_READ,
             };
 
-            hr = Direct3D.CreateTexture2D(_device, staging, out _staging);
-            return hr < 0 ? $"staging texture creation failed ({Describe(hr)})" : null;
+            Check(Direct3D.CreateTexture2D(_device, staging, out _staging), "staging texture creation failed");
         }
         finally
         {
@@ -278,24 +283,17 @@ internal sealed unsafe class DesktopDuplication : IDisposable
 
     /// <summary>
     /// Duplicates an HDR screen in its 16-bit floating-point format and sets up the conversion to
-    /// SDR. Returns null on success, otherwise why not; the caller then falls back to the 8-bit image.
+    /// SDR. Throws saying why that is not possible, leaving nothing set up; the caller then falls
+    /// back to the 8-bit image.
     /// </summary>
-    private string? StartHdrDuplication(IntPtr output, int featureLevel)
+    private void StartHdrDuplication(IntPtr output, int featureLevel)
     {
         if (featureLevel < Direct3D.D3D_FEATURE_LEVEL_11_0)
         {
-            return "the graphics adapter is older than Direct3D 11";
+            throw new InvalidOperationException("the graphics adapter is older than Direct3D 11");
         }
 
-        try
-        {
-            _converter = new HdrToSdrConverter(_device, _context, _width, _height);
-        }
-        catch (Exception ex) when (ex is InvalidOperationException or DllNotFoundException or EntryPointNotFoundException)
-        {
-            return ex.Message;
-        }
-
+        _converter = new HdrToSdrConverter(_device, _context, _width, _height);
         int hr = Direct3D.DuplicateOutput1(output, _device, [Direct3D.DXGI_FORMAT_R16G16B16A16_FLOAT], out _duplication);
         if (hr >= 0)
         {
@@ -303,7 +301,7 @@ internal sealed unsafe class DesktopDuplication : IDisposable
             if (desc.Format == Direct3D.DXGI_FORMAT_R16G16B16A16_FLOAT)
             {
                 RefreshWhiteLevel();
-                return null;
+                return;
             }
 
             Direct3D.Release(ref _duplication);
@@ -312,7 +310,7 @@ internal sealed unsafe class DesktopDuplication : IDisposable
 
         _converter.Dispose();
         _converter = null;
-        return $"16-bit duplication is not available: {Describe(hr)}";
+        throw new InvalidOperationException($"16-bit duplication is not available: {Describe(hr)}");
     }
 
     /// <summary>For an HDR screen, reads the SDR content brightness every couple of seconds; true when it changed.</summary>

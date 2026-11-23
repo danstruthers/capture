@@ -51,8 +51,9 @@ internal readonly record struct VideoStats(
 /// change or a hardware failure), so it alone writes <c>_encoder</c>, <c>_config</c> and
 /// <c>_encoderPreference</c>; other threads only read the current values.</item>
 /// <item>The JPEG thread encodes pictures.</item>
-/// <item>Callers (the capture session) set the demand and the frame rate from any thread;
-/// <c>_configLock</c> guards the frame rate change waiting for the H.264 thread.</item>
+/// <item>Callers (the capture session) set the demand and the frame rate from any thread. The
+/// capture thread follows a new frame rate at once; the H.264 thread notices that it differs from
+/// its encoder's and replaces the encoder before the next frame.</item>
 /// </list>
 /// <see cref="FrameEncoded"/> is raised on whichever thread the encoder delivers on: the H.264
 /// thread, a hardware encoder's event thread, or the thread disposing an encoder that is drained.
@@ -66,26 +67,28 @@ internal sealed unsafe class VideoPipeline : IDisposable
 
     private readonly VideoSettings _settings;
     private readonly MediaClock _clock;
+    private readonly Func<H264EncoderConfig, EncoderPreference, H264Encoder> _createEncoder;
     private readonly ScreenCapturer _capturer;
     private readonly VideoConverter _converter;
     private readonly BlockingCollection<(IMFSample Sample, long Timestamp)> _h264Queue = new(boundedCapacity: 2);
     private readonly ManualResetEventSlim _demand = new(false);
     private readonly AutoResetEvent _jpegSignal = new(false);
-    private readonly object _configLock = new();
     private readonly Thread _captureThread;
     private readonly Thread _h264Thread;
     private readonly Thread _jpegThread;
 
+    // The size of the video, H.264 and JPEG alike (see ChooseOutputSize).
+    private readonly int _width;
+    private readonly int _height;
+
     private volatile H264Encoder _encoder;
     private volatile H264EncoderConfig _config;
-    private H264EncoderConfig? _pendingConfig;
 
     // Which kind of encoder to create when the frame rate changes. Starts as configured; becomes
     // Software once this stream has had to use the software encoder (no usable hardware encoder, or
     // one that failed while running), so that a change does not search for hardware encoders again.
     private EncoderPreference _encoderPreference;
     private PendingFrame? _jpegPending;
-    private long _frameInterval;
     private volatile int _frameRate;
     private volatile bool _wantH264;
     private volatile bool _wantJpeg;
@@ -105,24 +108,29 @@ internal sealed unsafe class VideoPipeline : IDisposable
     private long _encodeTicks;
     private long _jpegTicks;
 
-    public VideoPipeline(CaptureArea area, VideoSettings settings, MediaClock clock)
+    /// <param name="createEncoder">
+    /// Makes the H.264 encoder for a configuration: <see cref="H264Encoders.Create"/>, unless a test
+    /// puts a simulated hardware encoder here. The software encoder that takes over from a failed
+    /// hardware encoder is always the real one.
+    /// </param>
+    public VideoPipeline(CaptureArea area, VideoSettings settings, MediaClock clock, Func<H264EncoderConfig, EncoderPreference, H264Encoder>? createEncoder = null)
     {
         _settings = settings;
         _clock = clock;
+        _createEncoder = createEncoder ?? H264Encoders.Create;
         Area = area;
 
-        (int width, int height) = ChooseOutputSize(area, settings);
-        _config = CreateConfig(width, height, settings.Fps);
-        _frameInterval = _config.FrameDuration;
+        (_width, _height) = ChooseOutputSize(area, settings);
+        _config = CreateConfig(settings.Fps);
         _frameRate = settings.Fps;
 
         _capturer = new ScreenCapturer(area, settings.DrawCursor, settings.CaptureMethod);
         try
         {
-            _converter = new VideoConverter(_capturer.Width, _capturer.Height, width, height, settings.Fps, MFMediaType.NV12, _config.Bt709);
+            _converter = VideoConverter.ToNv12(_capturer.Width, _capturer.Height, _width, _height, _config.Bt709);
             try
             {
-                _encoder = H264Encoders.Create(_config, settings.Encoder);
+                _encoder = _createEncoder(_config, settings.Encoder);
                 _encoder.FrameEncoded += OnFrameEncoded;
                 _encoderPreference = _encoder.IsHardware ? settings.Encoder : EncoderPreference.Software;
             }
@@ -215,21 +223,7 @@ internal sealed unsafe class VideoPipeline : IDisposable
     /// Changes the frame rate while running. Capture follows immediately; the H.264 encoder is
     /// replaced by one configured for the new rate before the next frame it encodes.
     /// </summary>
-    public void SetFrameRate(int fps)
-    {
-        lock (_configLock)
-        {
-            if (fps == _frameRate)
-            {
-                return;
-            }
-
-            H264EncoderConfig current = _config;
-            _pendingConfig = CreateConfig(current.Width, current.Height, fps);
-            _frameRate = fps;
-            Volatile.Write(ref _frameInterval, _pendingConfig.FrameDuration);
-        }
-    }
+    public void SetFrameRate(int fps) => _frameRate = fps;
 
     public void RequestKeyFrame() => _encoder.RequestKeyFrame();
 
@@ -322,13 +316,13 @@ internal sealed unsafe class VideoPipeline : IDisposable
     /// <summary>4:2:0 video needs even dimensions.</summary>
     private static int ToEven(double value) => Math.Max(64, (int)Math.Round(value) & ~1);
 
-    private H264EncoderConfig CreateConfig(int width, int height, int fps)
+    private H264EncoderConfig CreateConfig(int fps)
     {
         // Without an explicit bit rate: about 0.07 bits per pixel per frame, which keeps text sharp at
         // screen-content motion levels and scales the bit rate down with the frame rate.
-        int bitrate = _settings.BitrateBps ?? (int)Math.Clamp((double)width * height * fps * 0.07, 500_000, 20_000_000);
+        int bitrate = _settings.BitrateBps ?? (int)Math.Clamp((double)_width * _height * fps * 0.07, 500_000, 20_000_000);
         int gopFrames = Math.Max(1, (int)Math.Round(_settings.GopSeconds * fps));
-        return new H264EncoderConfig(width, height, fps, bitrate, gopFrames, _settings.Profile);
+        return new H264EncoderConfig(_width, _height, fps, bitrate, gopFrames, _settings.Profile);
     }
 
     private void CaptureLoop()
@@ -383,7 +377,7 @@ internal sealed unsafe class VideoPipeline : IDisposable
                     }
                 }
 
-                long interval = Volatile.Read(ref _frameInterval);
+                long interval = MediaClock.TicksPerSecond / _frameRate;
 
                 if (wantH264)
                 {
@@ -439,7 +433,7 @@ internal sealed unsafe class VideoPipeline : IDisposable
                 long started;
                 try
                 {
-                    ApplyPendingConfig(); // not timed: setting up an encoder is not converting
+                    FollowFrameRate(); // not timed: setting up an encoder is not converting
                     started = Stopwatch.GetTimestamp();
                     converted = _converter.Convert(sample, timestamp, _config.FrameDuration);
                 }
@@ -466,22 +460,17 @@ internal sealed unsafe class VideoPipeline : IDisposable
     /// control and GOP length are fixed when it is set up, so a change means a new encoder; its
     /// first frame is a key frame, and consumers carry on from there.
     /// </summary>
-    private void ApplyPendingConfig()
+    private void FollowFrameRate()
     {
-        H264EncoderConfig? pending;
-        lock (_configLock)
-        {
-            pending = _pendingConfig;
-            _pendingConfig = null;
-        }
-
-        if (pending is null)
+        int fps = _frameRate;
+        if (fps == _config.Fps)
         {
             return;
         }
 
+        H264EncoderConfig pending = CreateConfig(fps);
         RetireEncoder(drain: true);
-        H264Encoder replacement = H264Encoders.Create(pending, _encoderPreference);
+        H264Encoder replacement = _createEncoder(pending, _encoderPreference);
         if (!replacement.IsHardware)
         {
             _encoderPreference = EncoderPreference.Software;
@@ -553,8 +542,7 @@ internal sealed unsafe class VideoPipeline : IDisposable
                 try
                 {
                     long started = Stopwatch.GetTimestamp();
-                    H264EncoderConfig config = _config;
-                    encoder ??= new JpegEncoder(_capturer.Width, _capturer.Height, config.Width, config.Height, config.Fps, _settings.JpegQuality);
+                    encoder ??= new JpegEncoder(_capturer.Width, _capturer.Height, _width, _height, _settings.JpegQuality);
                     JpegFrame frame = encoder.Encode(pending.Sample, pending.Timestamp);
 
                     Interlocked.Add(ref _jpegTicks, Stopwatch.GetTimestamp() - started);

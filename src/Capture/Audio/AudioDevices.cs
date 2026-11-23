@@ -19,10 +19,13 @@ internal sealed record AudioDeviceInfo(string Id, string Name, AudioDeviceKind K
     /// <summary>Whether it is plugged in and enabled, so that it can be recorded.</summary>
     public bool IsConnected { get; init; } = true;
 
-    /// <summary>Whether it is Windows' default device of its kind.</summary>
+    /// <summary>
+    /// Whether it was Windows' default device of its kind when <see cref="AudioDevices.Enumerate"/>
+    /// listed it. Only that list says: a device looked up by ID (<see cref="AudioDevices.Get"/>) is never marked default.
+    /// </summary>
     public bool IsDefault { get; init; }
 
-    /// <summary>Its number in <see cref="AudioDevices.Enumerate"/> (and --list-devices), from 1; 0 when it is not in that list.</summary>
+    /// <summary>Its number in <see cref="AudioDevices.Enumerate"/> (and --list-devices), from 1; 0 for a device looked up by ID.</summary>
     public int Number { get; init; }
 }
 
@@ -137,7 +140,7 @@ internal static class AudioDevices
         if (int.TryParse(text, out int number))
         {
             return devices.FirstOrDefault(device => device.Number == number)
-                ?? throw new ArgumentException($"Audio device {number} does not exist. Use --list-devices to see the available devices.");
+                ?? throw new ArgumentException($"Audio device {number} does not exist.");
         }
 
         if (devices.FirstOrDefault(device => device.Name.Equals(text, StringComparison.CurrentCultureIgnoreCase)) is { } exact)
@@ -149,7 +152,7 @@ internal static class AudioDevices
         return matches.Count switch
         {
             1 => matches[0],
-            0 => throw new ArgumentException($"No audio device has a name containing \"{text}\". Use --list-devices to see the available devices."),
+            0 => throw new ArgumentException($"No audio device has a name containing \"{text}\"."),
             _ => throw new ArgumentException($"\"{text}\" matches {matches.Count} audio devices ({string.Join("; ", matches.Select(m => m.Name))}). Use more of the name, or the device number."),
         };
     }
@@ -233,6 +236,6 @@ internal static class AudioDevices
         public AudioDeviceInfo? Get(string id) => AudioDevices.Get(id);
 
         public IAudioSource Open(AudioDeviceInfo device, MediaClock clock) =>
-            device.Kind == AudioDeviceKind.Input ? new MicrophoneSource(device, clock) : new LoopbackSource(device, clock);
+            device.Kind == AudioDeviceKind.Input ? new RecordingDeviceSource(device, clock) : new LoopbackSource(device, clock);
     }
 }

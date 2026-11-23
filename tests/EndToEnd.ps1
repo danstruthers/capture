@@ -172,11 +172,21 @@ function Switch-AudioDevice([string]$id) {
 
 $processes = @()
 try {
-    Write-Host "Starting the capture client, the viewer host and Edge (output in $work)"
     # An empty configuration file, so that a local capture.json cannot change what is tested.
-    # The duration is a safety net: capture.exe ends by itself if this script dies without stopping it.
     $config = Join-Path $work 'capture.json'
     Set-Content -Path $config -Value '{}'
+
+    Write-Host 'Options that name a screen or audio device that is not there'
+    foreach ($option in @(@('--screens', '64'), @('--audio-device', 'NoDeviceIsCalledThis'))) {
+        $errors = Join-Path $work 'bad-option.err'
+        $run = Start-Process -FilePath $captureExe -WorkingDirectory $work -PassThru -Wait -WindowStyle Hidden `
+            -ArgumentList (@('--config', $config) + $option) -RedirectStandardOutput (Join-Path $work 'bad-option.log') -RedirectStandardError $errors
+        $message = (Get-Content $errors -Raw) -replace '\s+', ' '
+        Assert-That "$($option -join ' ') is refused as a mistake in the options" ($run.ExitCode -eq 2 -and $message -match '--list-devices') "exit code $($run.ExitCode): $message"
+    }
+
+    Write-Host "Starting the capture client, the viewer host and Edge (output in $work)"
+    # The duration is a safety net: capture.exe ends by itself if this script dies without stopping it.
     $capture = Start-Process -FilePath $captureExe -WorkingDirectory $work -PassThru -WindowStyle Hidden `
         -ArgumentList @('--config', $config, '--port', $CapturePort, '--layout', 'separate', '--no-record', '--output-dir', '.', '--stats', '0', '--duration', '600') `
         -RedirectStandardOutput $captureLog -RedirectStandardError (Join-Path $work 'capture.err')

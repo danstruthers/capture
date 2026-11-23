@@ -36,7 +36,7 @@ internal sealed unsafe class LoopbackSource : IAudioSource
         _systemTimeOffset = MFExtern.MFGetSystemTime() - clock.Now;
 
         // Everything, including opening the device, happens on one multithreaded-apartment thread.
-        _thread = new Thread(Run) { IsBackground = true, Name = "desktop-audio-capture" };
+        _thread = new Thread(Run) { IsBackground = true, Name = "loopback-capture" };
         _thread.SetApartmentState(ApartmentState.MTA);
         _thread.Start();
 
@@ -98,24 +98,24 @@ internal sealed unsafe class LoopbackSource : IAudioSource
         IMFMediaType outputType = Mf.CreatePcmType(PcmFormat.SampleRate, PcmFormat.Channels);
         try
         {
-            inputType.SetGUID(MFAttributesClsid.MF_MT_MAJOR_TYPE, MFMediaType.Audio);
-            inputType.SetGUID(MFAttributesClsid.MF_MT_SUBTYPE, format.IsFloat ? MFMediaType.Float : MFMediaType.PCM);
-            inputType.SetUINT32(MFAttributesClsid.MF_MT_AUDIO_NUM_CHANNELS, format.Channels);
-            inputType.SetUINT32(MFAttributesClsid.MF_MT_AUDIO_SAMPLES_PER_SECOND, format.SampleRate);
-            inputType.SetUINT32(MFAttributesClsid.MF_MT_AUDIO_BITS_PER_SAMPLE, format.BitsPerSample);
-            inputType.SetUINT32(MFAttributesClsid.MF_MT_AUDIO_BLOCK_ALIGNMENT, format.BlockAlign);
-            inputType.SetUINT32(MFAttributesClsid.MF_MT_AUDIO_AVG_BYTES_PER_SECOND, format.SampleRate * format.BlockAlign);
-            inputType.SetUINT32(MFAttributesClsid.MF_MT_ALL_SAMPLES_INDEPENDENT, 1);
+            Mf.Check(inputType.SetGUID(MFAttributesClsid.MF_MT_MAJOR_TYPE, MFMediaType.Audio), "Set MF_MT_MAJOR_TYPE");
+            Mf.Check(inputType.SetGUID(MFAttributesClsid.MF_MT_SUBTYPE, format.IsFloat ? MFMediaType.Float : MFMediaType.PCM), "Set MF_MT_SUBTYPE");
+            Mf.Check(inputType.SetUINT32(MFAttributesClsid.MF_MT_AUDIO_NUM_CHANNELS, format.Channels), "Set MF_MT_AUDIO_NUM_CHANNELS");
+            Mf.Check(inputType.SetUINT32(MFAttributesClsid.MF_MT_AUDIO_SAMPLES_PER_SECOND, format.SampleRate), "Set MF_MT_AUDIO_SAMPLES_PER_SECOND");
+            Mf.Check(inputType.SetUINT32(MFAttributesClsid.MF_MT_AUDIO_BITS_PER_SAMPLE, format.BitsPerSample), "Set MF_MT_AUDIO_BITS_PER_SAMPLE");
+            Mf.Check(inputType.SetUINT32(MFAttributesClsid.MF_MT_AUDIO_BLOCK_ALIGNMENT, format.BlockAlign), "Set MF_MT_AUDIO_BLOCK_ALIGNMENT");
+            Mf.Check(inputType.SetUINT32(MFAttributesClsid.MF_MT_AUDIO_AVG_BYTES_PER_SECOND, format.SampleRate * format.BlockAlign), "Set MF_MT_AUDIO_AVG_BYTES_PER_SECOND");
+            Mf.Check(inputType.SetUINT32(MFAttributesClsid.MF_MT_ALL_SAMPLES_INDEPENDENT, 1), "Set MF_MT_ALL_SAMPLES_INDEPENDENT");
 
             if (format.ValidBitsPerSample != format.BitsPerSample)
             {
-                inputType.SetUINT32(MFAttributesClsid.MF_MT_AUDIO_VALID_BITS_PER_SAMPLE, format.ValidBitsPerSample);
+                Mf.Check(inputType.SetUINT32(MFAttributesClsid.MF_MT_AUDIO_VALID_BITS_PER_SAMPLE, format.ValidBitsPerSample), "Set MF_MT_AUDIO_VALID_BITS_PER_SAMPLE");
             }
 
             if (format.ChannelMask != 0)
             {
                 // Tells the resampler which speaker each channel is, so surround layouts fold down to mono sensibly.
-                inputType.SetUINT32(MFAttributesClsid.MF_MT_AUDIO_CHANNEL_MASK, unchecked((int)format.ChannelMask));
+                Mf.Check(inputType.SetUINT32(MFAttributesClsid.MF_MT_AUDIO_CHANNEL_MASK, unchecked((int)format.ChannelMask)), "Set MF_MT_AUDIO_CHANNEL_MASK");
             }
 
             return new AudioResampler(inputType, outputType);
@@ -150,7 +150,7 @@ internal sealed unsafe class LoopbackSource : IAudioSource
                 Check(Wasapi.GetCaptureClient(audioClient, out captureClient), "Starting loopback capture");
                 resampler = CreateResampler(format);
                 Check(Wasapi.Start(audioClient), "Starting loopback capture");
-                Format = $"{format.SampleRate} Hz, {format.Channels} ch, {format.BitsPerSample}-bit {(format.IsFloat ? "float" : "PCM")}";
+                Format = PcmFormat.Describe(format.SampleRate, format.Channels, format.BitsPerSample, format.IsFloat ? "float" : "PCM");
             }
             catch (Exception ex)
             {
@@ -216,13 +216,7 @@ internal sealed unsafe class LoopbackSource : IAudioSource
                     ? _clock.Now - duration
                     : (long)qpcPosition - _systemTimeOffset;
 
-                var input = new ReadOnlySpan<byte>((void*)data, (int)frames * format.BlockAlign);
-                resampler.Process(input, pcm =>
-                {
-                    ReadOnlySpan<short> samples = MemoryMarshal.Cast<byte, short>(pcm);
-                    Timeline.Write(captureTime, samples);
-                    captureTime += (long)samples.Length * MediaClock.TicksPerSecond / PcmFormat.SampleRate;
-                });
+                resampler.Process(new ReadOnlySpan<byte>((void*)data, (int)frames * format.BlockAlign), Timeline.WriterFrom(captureTime));
             }
             finally
             {

@@ -40,7 +40,10 @@ internal sealed record DisplayInfo(int Index, string DeviceName, int Left, int T
         return displays;
     }
 
-    /// <summary>The screens with the given numbers, or all of them when no numbers are given.</summary>
+    /// <summary>
+    /// The screens with the given numbers, or all of them when no numbers are given. Throws
+    /// <see cref="ArgumentException"/> if a number names no screen.
+    /// </summary>
     public static IReadOnlyList<DisplayInfo> Select(IReadOnlyCollection<int>? numbers)
     {
         IReadOnlyList<DisplayInfo> displays = Enumerate();
@@ -59,7 +62,7 @@ internal sealed record DisplayInfo(int Index, string DeviceName, int Left, int T
             if (number < 1 || number > displays.Count)
             {
                 string range = displays.Count == 1 ? "only screen 1" : $"screens 1 to {displays.Count}";
-                throw new ArgumentException($"Screen {number} does not exist: this computer has {range}. --list-devices shows them.");
+                throw new ArgumentException($"Screen {number} does not exist: this computer has {range}.");
             }
         }
 

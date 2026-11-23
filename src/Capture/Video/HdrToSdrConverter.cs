@@ -22,7 +22,7 @@ internal sealed unsafe class HdrToSdrConverter : IDisposable
 
     // Writes BGRA into an RGBA texture: storing to a B8G8R8A8 view is optional for GPUs, R8G8B8A8
     // is not, and swapping the channels here gives the bytes the BGRA order the rest expects.
-    private const string ShaderSource = """
+    private static readonly string ShaderSource = $$"""
         Texture2D<float4> Desktop : register(t0);
         RWTexture2D<unorm float4> Picture : register(u0);
 
@@ -31,7 +31,7 @@ internal sealed unsafe class HdrToSdrConverter : IDisposable
             float Scale; // 80 nits / SDR white level in nits
         };
 
-        [numthreads(16, 16, 1)]
+        [numthreads({{ThreadGroupSize}}, {{ThreadGroupSize}}, 1)]
         void main(uint3 id : SV_DispatchThreadID)
         {
             uint width, height;

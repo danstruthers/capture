@@ -196,6 +196,10 @@ upsampled to 48 kHz and encoded as AAC-LC.
 - A pause leaves no gap: the files' timeline continues at the point of resuming.
 - An MP4 file is only playable once finalized (on stop, or Ctrl+C). `--segment <seconds>` starts
   new files every N seconds (`name-screen1-001.mp4`, ...) so that a crash costs at most one segment.
+- A stream's video can change format while recording: a new frame rate, or the software encoder
+  taking over from a hardware encoder that failed. An MP4 video track holds one format, so the
+  recording carries on in a new file, `name-screen1-part2.mp4`, `-part3`, ... (or the next
+  segment, with `--segment`).
 
 ### Video methods
 
