@@ -20,7 +20,8 @@ public sealed class AudioMixerTests : IDisposable
         _mixer?.Dispose();
     }
 
-    private AudioMixer Mixer(params string[] selection) => _mixer = new AudioMixer(_clock, _endpoints, selection);
+    // The periodic check is off: each test calls CheckDevices itself, so that no timer runs a check in between.
+    private AudioMixer Mixer(params string[] selection) => _mixer = new AudioMixer(_clock, _endpoints, selection, checkInterval: Timeout.InfiniteTimeSpan);
 
     /// <summary>Devices open and close in the background; this waits for them.</summary>
     private void Settle() => Assert.True(_mixer!.WaitUntilSettled(TimeSpan.FromSeconds(5)), "devices are still opening or closing");
@@ -83,10 +84,10 @@ public sealed class AudioMixerTests : IDisposable
         mixer.SetActive(true);
         Settle();
 
-        Assert.Contains("busy cannot be recorded", Assert.Throws<InvalidOperationException>(() => mixer.SetSelection(["busy"])).Message);
-        Assert.Contains("not connected", Assert.Throws<InvalidOperationException>(() => mixer.SetSelection(["mic", "unplugged"])).Message);
-        Assert.Throws<InvalidOperationException>(() => mixer.SetSelection(["no-such-device"]));
-        Assert.Contains("no playback device", Assert.Throws<InvalidOperationException>(() => mixer.SetSelection([AudioSelection.DefaultOutput])).Message);
+        Assert.Contains("busy cannot be recorded", Assert.Throws<RefusedException>(() => mixer.SetSelection(["busy"])).Message);
+        Assert.Contains("not connected", Assert.Throws<RefusedException>(() => mixer.SetSelection(["mic", "unplugged"])).Message);
+        Assert.Throws<RefusedException>(() => mixer.SetSelection(["no-such-device"]));
+        Assert.Contains("no playback device", Assert.Throws<RefusedException>(() => mixer.SetSelection([AudioSelection.DefaultOutput])).Message);
 
         Settle();
         Assert.Equal(["mic"], mixer.Selection);

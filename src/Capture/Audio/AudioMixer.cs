@@ -35,12 +35,19 @@ internal sealed record AudioInputStatus(string Id, AudioDeviceInfo? Device, Audi
 /// <para>
 /// Devices are only open while the mixer is active, so nothing listens to a microphone when
 /// nobody is recording or watching. Opening a device can take seconds (a monitor's speakers have
-/// to wake up), so devices open in the background, side by side, and each joins the mix when it
-/// is ready. Only a device someone has just selected is opened on the spot, so that they can be
-/// told if it cannot be. While active, the devices are looked at every two seconds: a device that
+/// to wake up), so devices open in the background, side by side, each on a thread of its own, and
+/// each joins the mix when it is ready. Only a device someone has just selected is opened while
+/// they wait, so that they can be told if it cannot be. While active, the devices are looked at every two seconds: a device that
 /// stopped or was unplugged is opened again once it is back, one that would not open is tried
 /// again less and less often, and an entry for Windows' default device moves over when the
 /// default changes.
+/// </para>
+/// <para>
+/// Threads: <see cref="SetSelection"/> runs on the thread of the request that asked for it,
+/// <see cref="SetActive"/> on the capture session's update thread, <see cref="CheckDevices"/> on a
+/// timer thread, and each device opens and closes on a thread of its own, reporting back through
+/// <c>Opened</c>. Frames are mixed, and <see cref="FrameCaptured"/> raised, on the mixer thread.
+/// Status (<see cref="GetInputs"/>, <see cref="Description"/>) can be read from any thread.
 /// </para>
 /// </summary>
 internal sealed class AudioMixer : IDisposable
@@ -52,15 +59,21 @@ internal sealed class AudioMixer : IDisposable
     private static readonly TimeSpan CheckInterval = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan MaxRetryDelay = TimeSpan.FromMinutes(1);
 
+    /// <summary>How long a newly selected device may take to open before the selection is refused.</summary>
+    private static readonly TimeSpan OpenTimeout = TimeSpan.FromSeconds(15);
+
     private readonly MediaClock _clock;
     private readonly IAudioEndpoints _endpoints;
+    private readonly TimeSpan _checkInterval;
 
     // Taken for every change (selection, activity, the periodic check, a device finishing opening),
-    // so that each one decides from a settled picture. Held while a newly selected device opens.
+    // so that each one decides from a settled picture. Held only while deciding: never while a
+    // device opens or closes, which can take seconds.
     private readonly object _changeLock = new();
 
-    // Guards what the mixing thread and status readers see; only ever held briefly. The fields
-    // below are read under it and changed under both locks.
+    // Guards what the mixing thread and status readers see; only ever held briefly. The fields from
+    // _open to _latency are read under it and changed under both locks; the mixing position
+    // (_nextFrame) belongs to the mixing thread and is reset under it.
     private readonly object _sync = new();
 
     private readonly ManualResetEventSlim _wake = new(false);
@@ -87,9 +100,11 @@ internal sealed class AudioMixer : IDisposable
     private bool _disposed;
 
     /// <param name="selection">Device IDs and <see cref="AudioSelection.DefaultInput"/> / <see cref="AudioSelection.DefaultOutput"/>.</param>
-    public AudioMixer(MediaClock clock, IAudioEndpoints endpoints, IEnumerable<string> selection)
+    /// <param name="checkInterval">How often the devices are looked at while active; tests turn it off (infinite) and call <see cref="CheckDevices"/> themselves.</param>
+    public AudioMixer(MediaClock clock, IAudioEndpoints endpoints, IEnumerable<string> selection, TimeSpan? checkInterval = null)
     {
         _clock = clock;
+        _checkInterval = checkInterval ?? CheckInterval;
         _endpoints = endpoints;
         _selection = AudioSelection.Normalize(selection);
         _resolved = ResolveAll(_selection);
@@ -139,7 +154,7 @@ internal sealed class AudioMixer : IDisposable
     }
 
     /// <summary>
-    /// Selects what to record. Throws <see cref="InvalidOperationException"/>, leaving the current
+    /// Selects what to record. Throws <see cref="RefusedException"/>, leaving the current
     /// selection in place, if a newly selected entry cannot be recorded: it names no device, its
     /// device is not connected, or (while active) the device cannot be opened.
     /// </summary>
@@ -148,9 +163,12 @@ internal sealed class AudioMixer : IDisposable
         string[] selection = AudioSelection.Normalize(entries);
         if (selection.Length > AudioSelection.MaxEntries)
         {
-            throw new InvalidOperationException($"At most {AudioSelection.MaxEntries} audio devices can be selected.");
+            throw new RefusedException($"At most {AudioSelection.MaxEntries} audio devices can be selected.");
         }
 
+        // Decided under the lock...
+        Dictionary<string, Resolution> resolved;
+        AudioDeviceInfo[] needed;
         lock (_changeLock)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
@@ -160,41 +178,60 @@ internal sealed class AudioMixer : IDisposable
                 return;
             }
 
-            Dictionary<string, Resolution> resolved = ResolveAll(selection);
+            resolved = ResolveAll(selection);
             foreach (string entry in added)
             {
                 if (resolved[entry].Problem is { } problem)
                 {
-                    throw new InvalidOperationException($"{Label(entry, resolved[entry].Device)} cannot be recorded: {problem}.");
+                    throw new RefusedException($"{Label(entry, resolved[entry].Device)} cannot be recorded: {problem}.");
                 }
             }
 
-            // While active, what was just selected opens now: if it cannot, the person is told and nothing changes.
-            Dictionary<string, IAudioSource> opened = [];
-            if (_active)
+            // While active, what was just selected is opened now: if it cannot be, the person is told and nothing changes.
+            needed = _active
+                ? [.. added.Select(entry => resolved[entry].Device!).DistinctBy(device => device.Id, AudioDevices.IdComparer).Where(device => !IsOpen(device.Id))]
+                : [];
+        }
+
+        // ...opened outside it, so that nothing else waits for a device that takes seconds to start...
+        Dictionary<string, IAudioSource> opened = OpenNow(needed);
+
+        // ...and applied under it again. If another selection was made meanwhile, this one replaces it.
+        lock (_changeLock)
+        {
+            if (_disposed)
             {
-                IEnumerable<AudioDeviceInfo> needed = added
-                    .Select(entry => resolved[entry].Device!)
-                    .DistinctBy(device => device.Id, AudioDevices.IdComparer)
-                    .Where(device => !IsOpen(device.Id));
-                opened = OpenNow(needed);
+                foreach (IAudioSource source in opened.Values)
+                {
+                    source.Dispose();
+                }
+
+                throw new ObjectDisposedException(nameof(AudioMixer));
             }
 
-            var replaced = new List<IAudioSource>();
+            var unused = new List<IAudioSource>();
             lock (_sync)
             {
                 _selection = selection;
                 _resolved = resolved;
                 foreach ((string id, IAudioSource source) in opened)
                 {
-                    if (_open.Remove(id, out IAudioSource? stopped))
+                    if (_open.TryGetValue(id, out IAudioSource? existing))
                     {
-                        replaced.Add(stopped);
+                        if (existing.Failure is null)
+                        {
+                            unused.Add(source); // opened in the background meanwhile
+                            continue;
+                        }
+
+                        unused.Add(existing); // stopped by itself; replaced
                     }
 
                     _open[id] = source;
                     _openFailures.Remove(id);
                 }
+
+                UpdateLatency();
             }
 
             foreach ((string id, IAudioSource source) in opened)
@@ -203,8 +240,8 @@ internal sealed class AudioMixer : IDisposable
                 Log.Debug($"Recording {source.Name} ({source.Format}).");
             }
 
-            replaced.ForEach(CloseLater);
-            Reconcile();
+            unused.ForEach(CloseLater);
+            Reconcile(); // closes what the new selection no longer needs, and opens what it needs besides
         }
     }
 
@@ -237,7 +274,7 @@ internal sealed class AudioMixer : IDisposable
             }
 
             Reconcile();
-            TimeSpan interval = active ? CheckInterval : Timeout.InfiniteTimeSpan;
+            TimeSpan interval = active ? _checkInterval : Timeout.InfiniteTimeSpan;
             _checkTimer.Change(interval, interval);
         }
 
@@ -471,28 +508,41 @@ internal sealed class AudioMixer : IDisposable
         return wanted;
     }
 
-    /// <summary>Opens devices side by side and waits for all of them; if one fails, closes the others and throws why.</summary>
-    private Dictionary<string, IAudioSource> OpenNow(IEnumerable<AudioDeviceInfo> devices)
+    /// <summary>Runs device work on a thread of its own: opening or closing a device can block for seconds, which must not tie up the shared thread pool.</summary>
+    private static Task<T> OnOwnThread<T>(Func<T> work) =>
+        Task.Factory.StartNew(work, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+
+    private static Task OnOwnThread(Action work) =>
+        Task.Factory.StartNew(work, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+
+    /// <summary>
+    /// Opens devices side by side and waits for all of them, for at most <see cref="OpenTimeout"/>.
+    /// If one fails or does not answer, closes the others (and that one, should it ever answer) and
+    /// throws why.
+    /// </summary>
+    private Dictionary<string, IAudioSource> OpenNow(IReadOnlyCollection<AudioDeviceInfo> devices)
     {
-        (AudioDeviceInfo Device, Task<IAudioSource> Task)[] opening = [.. devices.Select(device => (device, Task.Run(() => _endpoints.Open(device, _clock))))];
+        (AudioDeviceInfo Device, Task<IAudioSource> Task)[] opening = [.. devices.Select(device => (device, OnOwnThread(() => _endpoints.Open(device, _clock))))];
         try
         {
-            Task.WaitAll([.. opening.Select(item => item.Task)]);
+            Task.WaitAll([.. opening.Select(item => item.Task)], OpenTimeout);
         }
         catch (AggregateException)
         {
             // Looked at below.
         }
 
-        if (opening.FirstOrDefault(item => item.Task.IsFaulted) is { Task: not null } failed)
+        if (opening.FirstOrDefault(item => !item.Task.IsCompletedSuccessfully) is { Task: not null } failed)
         {
-            foreach ((_, Task<IAudioSource> task) in opening.Where(item => item.Task.IsCompletedSuccessfully))
+            foreach ((_, Task<IAudioSource> task) in opening)
             {
-                task.Result.Dispose();
+                _ = task.ContinueWith(done => done.Result.Dispose(), TaskContinuationOptions.OnlyOnRanToCompletion);
             }
 
-            Exception error = failed.Task.Exception!.InnerException!;
-            throw new InvalidOperationException($"{failed.Device.Name} cannot be recorded: {error.Message}", error);
+            string reason = failed.Task.IsFaulted
+                ? failed.Task.Exception!.InnerException!.Message
+                : $"it did not respond within {OpenTimeout.TotalSeconds:0} s.";
+            throw new RefusedException($"{failed.Device.Name} cannot be recorded: {reason}", failed.Task.Exception?.InnerException);
         }
 
         return opening.ToDictionary(item => item.Device.Id, item => item.Task.Result, AudioDevices.IdComparer);
@@ -585,7 +635,7 @@ internal sealed class AudioMixer : IDisposable
     private void OpenLater(AudioDeviceInfo device)
     {
         _pending.RemoveAll(task => task.IsCompleted);
-        _pending.Add(Task.Run(() =>
+        _pending.Add(OnOwnThread(() =>
         {
             try
             {
@@ -601,7 +651,7 @@ internal sealed class AudioMixer : IDisposable
     private void CloseLater(IAudioSource source)
     {
         _pending.RemoveAll(task => task.IsCompleted);
-        _pending.Add(Task.Run(source.Dispose));
+        _pending.Add(OnOwnThread(source.Dispose));
     }
 
     /// <summary>A device opened in the background is ready, or could not be opened.</summary>

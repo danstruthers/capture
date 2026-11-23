@@ -39,9 +39,9 @@
     </section>
 
     <aside class="panel">
-      <section id="control" aria-label="Remote control">
-        <h2>Remote control</h2>
-        <p id="control-note" class="note">Connect to control the capture client.</p>
+      <section aria-labelledby="control-title">
+        <h2 id="control-title">Remote control</h2>
+        <p id="control-note" class="note" role="status">Connect to control the capture client.</p>
 
         <div class="control-row">
           <div class="control-head">
@@ -98,9 +98,9 @@
         </div>
       </section>
 
-      <section id="audio-devices" aria-label="Audio devices">
-        <h2>Audio devices</h2>
-        <p id="audio-note" class="note">Connect to see the audio devices.</p>
+      <section id="audio-devices" aria-labelledby="audio-devices-title">
+        <h2 id="audio-devices-title">Audio devices</h2>
+        <p id="audio-note" class="note" role="status">Connect to see the audio devices.</p>
         <div id="audio-groups" hidden>
           <p class="device-group" id="audio-inputs-label">Recording devices</p>
           <ul id="audio-inputs" class="devices" aria-labelledby="audio-inputs-label"></ul>
@@ -109,39 +109,39 @@
         </div>
       </section>
 
-      <section aria-label="Screens to watch">
-        <h2>Watch</h2>
+      <section aria-labelledby="watch-title">
+        <h2 id="watch-title">Watch</h2>
         <ul id="screens" class="screens"></ul>
       </section>
 
-      <section aria-label="Video statistics">
-        <h2>Video</h2>
+      <section aria-labelledby="video-stats-title">
+        <h2 id="video-stats-title">Video</h2>
         <dl id="video-stats"></dl>
       </section>
-      <section aria-label="Audio statistics">
-        <h2>Audio</h2>
+      <section aria-labelledby="audio-stats-title">
+        <h2 id="audio-stats-title">Audio</h2>
         <dl id="audio-stats"></dl>
         <div class="level">
           <span id="level-label">Level</span>
           <meter id="level" min="0" max="1" value="0" aria-labelledby="level-label"></meter>
         </div>
       </section>
-      <section aria-label="Connection statistics">
-        <h2>Connection</h2>
+      <section aria-labelledby="connection-stats-title">
+        <h2 id="connection-stats-title">Connection</h2>
         <dl id="connection-stats"></dl>
       </section>
     </aside>
 
-    <section class="log" aria-label="Events">
+    <section class="log" aria-labelledby="log-title">
       <div class="log-head">
-        <h2>Events</h2>
+        <h2 id="log-title">Events</h2>
         <button id="clear-log" type="button">Clear</button>
       </div>
-      <ol id="log" aria-live="polite"></ol>
+      <ol id="log" role="log"></ol>
     </section>
   </main>
 
-  <audio id="audio" hidden></audio>
+  <audio id="webrtc-audio" hidden></audio>
 
   <template id="tile-template">
     <figure class="tile">

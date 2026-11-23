@@ -1,31 +1,33 @@
-// Defaults for capture.exe.
+// Settings for capture.exe.
 //
-// Keys are the command-line option names without the dashes ("videoMode" or "video-mode"); run
-// "capture --help" for the full list. Anything given on the command line overrides this file.
-// capture.exe looks for capture.json in the current directory first, then next to itself.
+// Everything is commented out: capture.exe has the defaults shown, so only what you change needs
+// to be here. Uncomment a line and edit it to use it. Keys are the command-line option names
+// without the dashes ("videoMode" or "video-mode"); run "capture --help" for the full list.
+// Anything given on the command line overrides this file. capture.exe looks for capture.json in
+// the current directory first, then next to itself.
 {
   // "separate": each screen is its own stream. "desktop": all screens in one stream.
-  "layout": "separate",
+  // "layout": "separate",
 
   // Frames per second (1-60). Lower rates use less CPU; viewers can change it while running.
-  "fps": 30,
+  // "fps": 30,
 
   // How viewers get video: "h264" (WebRTC) or "jpeg" (pictures over the WebSocket).
-  "videoMode": "h264",
+  // "videoMode": "h264",
 
   // What the audio is: "microphone", "desktop" (what the PC is playing), "both" or "none", meaning
-  // Windows' default devices. To record particular devices, add "audioDevice": ["2", "Headset"]
-  // (numbers or parts of names from "capture --list-devices"). Viewers can change it while running.
-  "audioSource": "microphone",
+  // Windows' default devices. Particular devices, by number or part of the name (see
+  // "capture --list-devices"): "audioDevice": ["2", "Headset"]. Viewers can change it while running.
+  // "audioSource": "microphone",
 
   // Where recordings are saved. Environment variables work, e.g. "%USERPROFILE%\\Videos\\Capture".
-  "outputDir": "%TEMP%",
+  // "outputDir": "%TEMP%",
 
   // Whether recording and streaming start at launch. Either can be started later from a viewer.
-  "record": true,
-  "stream": true,
+  // "record": true,
+  // "stream": true,
 
   // Where viewers connect. Use "0.0.0.0" to accept viewers from other machines.
-  "bind": "127.0.0.1",
-  "port": 8081
+  // "bind": "127.0.0.1",
+  // "port": 8081
 }

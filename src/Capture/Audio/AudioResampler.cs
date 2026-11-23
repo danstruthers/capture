@@ -56,14 +56,9 @@ internal sealed unsafe class AudioResampler : IDisposable
         {
             Mf.Check(_outputBuffer.SetCurrentLength(0), "Reset resampler output buffer");
             IMFSample output = Mf.CreateSample(_outputBuffer);
-            IntPtr outputPointer = Marshal.GetComInterfaceForObject(output, typeof(IMFSample));
             try
             {
-                var buffers = new MFTOutputDataBuffer[1];
-                buffers[0].pSample = outputPointer;
-
-                HResult hr = _transform.ProcessOutput(MFTProcessOutputFlags.None, 1, buffers, out _);
-                Mf.Release(buffers[0].pEvents);
+                HResult hr = Mf.ProcessOutput(_transform, output, out _);
                 if (hr == HResult.MF_E_TRANSFORM_NEED_MORE_INPUT)
                 {
                     return;
@@ -88,7 +83,6 @@ internal sealed unsafe class AudioResampler : IDisposable
             }
             finally
             {
-                Marshal.Release(outputPointer);
                 Mf.Release(output);
             }
         }

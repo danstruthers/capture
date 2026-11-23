@@ -115,12 +115,52 @@ public sealed class OptionsTests : IDisposable
     }
 
     [Fact]
+    public void An_on_off_option_takes_true_or_false_after_an_equals_sign()
+    {
+        Assert.False(Load("--record=false").Record);
+        Assert.True(Load("--record=true").Record);
+        Assert.True(Load("--no-record=false").Record);
+        Assert.False(Load("--no-stream=yes").Stream);
+        Assert.Contains("--record", Assert.Throws<ArgumentException>(() => Load("--record=maybe")).Message);
+    }
+
+    [Fact]
     public void Audio_devices_can_be_given_several_times_and_as_a_list()
     {
         string config = Config("""{ "audioDevice": ["2", "Speakers (Realtek"] }""");
 
-        Assert.Equal(["2", "Speakers (Realtek", "USB"], Options.Load(["--config", config, "--audio-device", " USB "]).AudioDeviceSelectors);
+        Assert.Equal(["2", "Speakers (Realtek"], Options.Load(["--config", config]).AudioDeviceSelectors);
+        Assert.Equal(["USB", "3"], Load("--audio-device", " USB ", "--audio-device", "3").AudioDeviceSelectors);
         Assert.Empty(Load().AudioDeviceSelectors);
+    }
+
+    [Fact]
+    public void A_list_on_the_command_line_replaces_the_one_in_the_configuration_file()
+    {
+        string config = Config("""{ "audioDevice": ["2"], "allowOrigin": ["http://a:1"], "screens": [1, 2] }""");
+
+        Options options = Options.Load(["--config", config, "--audio-device", "USB", "--allow-origin", "http://b:2", "--screens", "3"]);
+
+        Assert.Equal(["USB"], options.AudioDeviceSelectors);
+        Assert.Equal(["http://b:2"], options.AllowedOrigins);
+        Assert.Equal([3], options.Screens);
+    }
+
+    [Fact]
+    public void Every_option_in_the_help_is_one_the_parser_knows()
+    {
+        // The options the help lists: the names that start its option lines ("  -o, --output <file>  ...").
+        string[] names = [.. System.Text.RegularExpressions.Regex.Matches(Options.Usage, @"^  (?:-\S, )?(--[a-z][a-z-]*[a-z])", System.Text.RegularExpressions.RegexOptions.Multiline)
+            .Select(m => m.Groups[1].Value)];
+        Assert.True(names.Length > 30, $"only {names.Length} options found in the help");
+        Assert.Contains("--audio-device", names);
+        Assert.Contains("--no-record", names);
+
+        foreach (string name in names.Where(name => name != "--config"))
+        {
+            ArgumentException? error = Record.Exception(() => Load(name)) as ArgumentException;
+            Assert.True(error is null || error.Message.Contains("needs a value") || error.Message.Contains("nothing"), $"{name}: {error?.Message}");
+        }
     }
 
     [Fact]

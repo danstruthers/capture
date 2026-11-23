@@ -3,42 +3,23 @@
 // A test client for the capture client. It connects to the capture client's WebSocket, shows what
 // the capture client is doing, plays its video streams (one per screen, or one for the whole
 // desktop) and lets you control it. Each screen can be zoomed with the mouse wheel and moved into
-// a window of its own.
+// a window of its own: a popped-out screen is this same page in a window of its own
+// (?popout=<stream id>), with its own connection that asks for that one stream and no audio.
 //
-// Text messages on the socket are JSON:
-//   capture -> viewer   {"type":"state", layout, sources, recording, streaming, video, audio, remoteControl}
-//                       {"type":"error","message":...}
-//                       {"type":"offer","sdp":...,"sources":{"<mid>":"<stream id>",...}}  and ICE candidates
-//   viewer -> capture   {"type":"select","sources":["screen1",...],"audio":true}    what this window shows
-//                       {"type":"command","target":"recording"|"streaming","action":"start"|"stop"|"pause"|"resume"}
-//                       {"type":"configure","frameRate":15}  /  "videoMode":"h264"|"jpeg"  /
-//                         "audioDevices":["default-input","<device id>",...]  /  "layout":"separate"|"desktop"
-//                       {"type":"answer","sdp":...}  and ICE candidates
-//
-// The state's audio.devices lists every audio device the capture client can record, recording
-// devices ("input") and playback devices ("output", recorded as what they play), each with its
-// id, whether it is selected and how it is doing. "default-input" and "default-output" stand for
-// Windows' default devices and follow them when they change.
-//
-// Media arrives in one of two ways, chosen by the capture client's video mode:
-//   h264  a WebRTC session offered by the capture client: one H.264 track per stream, G.711 audio
-//   jpeg  binary messages on the socket: [type: 1 byte][stream number: 1 byte][timestamp: int64 LE, 100 ns][payload],
-//         type 1 = a JPEG picture of that stream, type 2 = 16-bit little-endian PCM at 8 kHz mono
-//
-// A popped-out screen is this same page in a window of its own (?popout=<stream id>), with its
-// own connection that asks for that one stream and no audio.
+// The messages are in protocol.js. The page keeps one session per connection (see connect()), and
+// everything on the page is drawn from that session's state by render().
+
+import { describeCodec, EMPTY, formatBitRate, formatBytes, formatCount, formatDuration, formatMilliseconds } from './format.js';
+import { PcmPlayer } from './pcm-player.js';
+import {
+  addressFor, AUDIO_MESSAGE, commandMessage, configureMessage, isDefaultDeviceEntry, parseMediaMessage, pcmSamples, PICTURE_MESSAGE, selectMessage,
+} from './protocol.js';
+import { Zoom } from './zoom.js';
 
 const DEFAULT_URL = 'ws://localhost:8081/';
 const URL_STORAGE_KEY = 'capture-viewer.url';
 const STATS_INTERVAL_MS = 1000;
 const MAX_LOG_LINES = 300;
-const MAX_ZOOM = 8;
-const EMPTY = '–';
-
-const PICTURE_MESSAGE = 1;
-const AUDIO_MESSAGE = 2;
-const HEADER_LENGTH = 10;
-const PCM_SAMPLE_RATE = 8000;
 
 const STAT_FIELDS = {
   video: ['Streams', 'Codec', 'Frame rate', 'Bit rate', 'Frames shown', 'Frames dropped', 'Key frames', 'Packets lost', 'Jitter'],
@@ -49,7 +30,7 @@ const STAT_FIELDS = {
 const parameters = new URLSearchParams(location.search);
 
 /** In a pop-out window: the id of the one stream it shows. */
-const POPOUT = parameters.get('popout');
+const POPOUT_STREAM_ID = parameters.get('popout');
 
 const byId = (id) => document.getElementById(id);
 
@@ -67,7 +48,7 @@ const el = {
   unmute: byId('unmute'),
   mute: byId('mute'),
   fullscreen: byId('fullscreen'),
-  audio: byId('audio'),
+  webrtcAudio: byId('webrtc-audio'),
   level: byId('level'),
   log: byId('log'),
   clearLog: byId('clear-log'),
@@ -114,7 +95,8 @@ const statCells = {};
 let screenListKey = '';
 let audioListKey = '';
 
-const DEFAULT_DEVICE_IDS = ['default-input', 'default-output'];
+/** The id of the last command or configure request; an error refusing a request carries its id. */
+let lastRequestId = 0;
 
 // ---------------------------------------------------------------------------------------------
 // Page chrome
@@ -195,166 +177,12 @@ function toggleFullscreen(element) {
   }
 }
 
-// ---------------------------------------------------------------------------------------------
-// Formatting
-// ---------------------------------------------------------------------------------------------
-
-function formatBitRate(bitsPerSecond) {
-  if (bitsPerSecond === undefined) {
-    return EMPTY;
-  }
-  return bitsPerSecond >= 1_000_000
-    ? `${(bitsPerSecond / 1_000_000).toFixed(2)} Mbit/s`
-    : `${Math.round(bitsPerSecond / 1000)} kbit/s`;
-}
-
-function formatMilliseconds(seconds) {
-  return seconds === undefined ? EMPTY : `${(seconds * 1000).toFixed(1)} ms`;
-}
-
-function formatBytes(bytes) {
-  if (bytes === undefined) {
-    return EMPTY;
-  }
-  return bytes >= 1_048_576 ? `${(bytes / 1_048_576).toFixed(1)} MB` : `${Math.round(bytes / 1024)} KB`;
-}
-
-function formatDuration(milliseconds) {
-  const total = Math.floor(milliseconds / 1000);
-  const hours = Math.floor(total / 3600);
-  const minutes = String(Math.floor((total % 3600) / 60)).padStart(2, '0');
-  const seconds = String(total % 60).padStart(2, '0');
-  return hours > 0 ? `${hours}:${minutes}:${seconds}` : `${minutes}:${seconds}`;
-}
-
-function formatCount(value) {
-  return value === undefined ? EMPTY : value.toLocaleString();
-}
-
-/** "video/H264" + "profile-level-id=42e01f" -> "H.264 Constrained Baseline". */
-function describeCodec(codec) {
-  if (!codec?.mimeType) {
-    return EMPTY;
-  }
-
-  const name = codec.mimeType.split('/')[1];
-  if (name.toUpperCase() === 'H264') {
-    const match = /profile-level-id=([0-9a-f]{6})/i.exec(codec.sdpFmtpLine ?? '');
-    if (!match) {
-      return 'H.264';
-    }
-    const profileIdc = parseInt(match[1].slice(0, 2), 16);
-    const constraints = parseInt(match[1].slice(2, 4), 16);
-    const profile = { 66: 'Baseline', 77: 'Main', 100: 'High' }[profileIdc] ?? `profile ${profileIdc}`;
-    const constrained = profileIdc === 66 && (constraints & 0x40) !== 0;
-    return `H.264 ${constrained ? 'Constrained ' : ''}${profile}`;
-  }
-
-  const rate = codec.clockRate ? `, ${codec.clockRate / 1000} kHz` : '';
-  const friendly = { PCMU: 'G.711 µ-law', PCMA: 'G.711 A-law' }[name.toUpperCase()];
-  return friendly ? `${friendly}${rate}` : `${name}${rate}`;
-}
-
 function sourceById(id) {
   return session?.state?.sources.find((source) => source.id === id) ?? null;
 }
 
 function sourceName(id) {
   return sourceById(id)?.name ?? id;
-}
-
-// ---------------------------------------------------------------------------------------------
-// Zoom: mouse wheel zooms around the pointer, dragging moves, double-click resets
-// ---------------------------------------------------------------------------------------------
-
-class Zoom {
-  constructor(view, targets, onChange) {
-    this.view = view;
-    this.targets = targets;
-    this.onChange = onChange;
-    this.scale = 1;
-    this.x = 0;
-    this.y = 0;
-    this.drag = null;
-
-    view.addEventListener('wheel', (event) => this.onWheel(event), { passive: false });
-    view.addEventListener('pointerdown', (event) => this.onPointerDown(event));
-    view.addEventListener('pointermove', (event) => this.onPointerMove(event));
-    view.addEventListener('pointerup', (event) => this.onPointerUp(event));
-    view.addEventListener('pointercancel', (event) => this.onPointerUp(event));
-    view.addEventListener('dblclick', () => this.reset());
-    this.resizeObserver = new ResizeObserver(() => this.apply());
-    this.resizeObserver.observe(view);
-  }
-
-  onWheel(event) {
-    event.preventDefault(); // the wheel zooms the picture here instead of scrolling the page
-    const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? this.view.clientHeight : 1;
-    const factor = Math.exp(-event.deltaY * unit * 0.002);
-    const rect = this.view.getBoundingClientRect();
-    this.zoomAt(this.scale * factor, event.clientX - rect.left, event.clientY - rect.top);
-  }
-
-  /** Zooms to `scale`, keeping the picture point under (px, py) where it is. */
-  zoomAt(scale, px, py) {
-    const next = Math.min(MAX_ZOOM, Math.max(1, scale));
-    this.x = px - ((px - this.x) * next) / this.scale;
-    this.y = py - ((py - this.y) * next) / this.scale;
-    this.scale = next;
-    this.apply();
-  }
-
-  reset() {
-    this.scale = 1;
-    this.x = 0;
-    this.y = 0;
-    this.apply();
-  }
-
-  /** Keeps the picture covering the view, then applies the transform. */
-  apply() {
-    const width = this.view.clientWidth;
-    const height = this.view.clientHeight;
-    this.x = Math.min(0, Math.max(width - width * this.scale, this.x));
-    this.y = Math.min(0, Math.max(height - height * this.scale, this.y));
-    const transform = this.scale === 1 ? '' : `translate(${this.x}px, ${this.y}px) scale(${this.scale})`;
-    for (const target of this.targets) {
-      target.style.transform = transform;
-    }
-    this.view.classList.toggle('zoomed', this.scale > 1);
-    this.onChange(this.scale);
-  }
-
-  onPointerDown(event) {
-    if (event.button !== 0 || this.scale === 1) {
-      return;
-    }
-    this.drag = { id: event.pointerId, x: event.clientX, y: event.clientY };
-    this.view.setPointerCapture(event.pointerId);
-    this.view.classList.add('dragging');
-  }
-
-  onPointerMove(event) {
-    if (this.drag?.id !== event.pointerId) {
-      return;
-    }
-    this.x += event.clientX - this.drag.x;
-    this.y += event.clientY - this.drag.y;
-    this.drag.x = event.clientX;
-    this.drag.y = event.clientY;
-    this.apply();
-  }
-
-  onPointerUp(event) {
-    if (this.drag?.id === event.pointerId) {
-      this.drag = null;
-      this.view.classList.remove('dragging');
-    }
-  }
-
-  dispose() {
-    this.resizeObserver.disconnect();
-  }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -377,6 +205,7 @@ class Tile {
     this.wait = this.element.querySelector('.tile-wait');
     this.track = null;
     this.receiving = false;
+    this.waitingSince = performance.now();
 
     this.zoom = new Zoom(this.view, [this.video, this.canvas], (scale) => {
       this.zoomButton.textContent = `${Math.round(scale * 100)}%`;
@@ -384,7 +213,7 @@ class Tile {
     this.zoomButton.addEventListener('click', () => this.zoom.reset());
     this.fullscreenButton.addEventListener('click', () => toggleFullscreen(this.element));
 
-    if (POPOUT) {
+    if (POPOUT_STREAM_ID) {
       this.popoutButton.textContent = 'Close';
       this.popoutButton.title = 'Close this window. The screen goes back to the main window.';
       this.popoutButton.addEventListener('click', () => window.close());
@@ -443,14 +272,14 @@ class Tile {
   markReceiving() {
     if (!this.receiving) {
       this.setReceiving(true);
-      const s = session;
-      if (s) {
-        log(`${this.source.name}: first picture after ${Math.round(performance.now() - s.mediaStartedAt)} ms`, 'good');
-      }
+      log(`${this.source.name}: first picture after ${Math.round(performance.now() - this.waitingSince)} ms`, 'good');
     }
   }
 
   setReceiving(receiving) {
+    if (!receiving) {
+      this.waitingSince = performance.now(); // for the "first picture after" log
+    }
     this.receiving = receiving;
     this.wait.hidden = receiving;
   }
@@ -475,15 +304,15 @@ class Tile {
 /** The streams this window shows: everything ticked that is not in a window of its own, or the one stream of a pop-out. */
 function wantedSources() {
   const sources = session?.state?.sources ?? [];
-  if (POPOUT) {
-    return sources.filter((source) => source.id === POPOUT);
+  if (POPOUT_STREAM_ID) {
+    return sources.filter((source) => source.id === POPOUT_STREAM_ID);
   }
   return sources
     .filter((source) => !deselected.has(source.id) && !popouts.has(source.id))
     .sort((a, b) => a.left - b.left || a.top - b.top); // as the screens are arranged
 }
 
-/** Brings the tiles in line with what should be shown, then tells the capture client. */
+/** Brings the tiles in line with the streams this window should show. */
 function renderTiles() {
   const s = session;
   const state = s?.state;
@@ -516,11 +345,23 @@ function renderTiles() {
     el.tiles.append(...order);
   }
   el.tiles.style.setProperty('--columns', wanted.length <= 1 ? 1 : wanted.length <= 4 ? 2 : 3);
+}
 
+/**
+ * Draws the whole page from the session's state and this window's own choices (screens ticked or
+ * popped out, sound muted). Whatever changes either calls this; each part only changes what is
+ * different, so calling it often is cheap. Telling the capture client what this window wants is
+ * separate: syncSelection().
+ */
+function render() {
+  const state = session?.state ?? null;
+  renderTiles();
   updatePlaceholder();
   updatePlaybackControls();
   renderScreenList();
-  sendSelection();
+  showControls(state);
+  renderAudioDevices(state);
+  el.pausedBadge.hidden = state?.streaming.state !== 'paused';
 }
 
 function updatePlaceholder() {
@@ -538,8 +379,8 @@ function updatePlaceholder() {
     title = 'Streaming is stopped';
     text = state.remoteControl ? 'Press Start under Streaming to watch.' : 'It has to be started on the capture client.';
   } else if (tiles.size === 0) {
-    if (POPOUT) {
-      title = `${sourceName(POPOUT)} is no longer captured`;
+    if (POPOUT_STREAM_ID) {
+      title = `${sourceName(POPOUT_STREAM_ID)} is no longer captured`;
       text = 'The capture client changed its layout. Close this window.';
     } else if (state.sources.length > 0 && state.sources.every((source) => popouts.has(source.id))) {
       title = 'Every screen is in its own window';
@@ -555,13 +396,13 @@ function updatePlaceholder() {
   el.placeholderText.textContent = text;
 }
 
-/** Tells the capture client which streams this window wants, so it is sent (and has to encode) nothing else. */
-function sendSelection() {
+/** Tells the capture client which streams this window shows, so it is sent (and has to encode) nothing else. */
+function syncSelection() {
   const s = session;
   if (!s?.state || s.socket.readyState !== WebSocket.OPEN) {
     return;
   }
-  const message = { type: 'select', sources: [...tiles.keys()].sort(), audio: !POPOUT };
+  const message = selectMessage([...tiles.keys()].sort(), !POPOUT_STREAM_ID);
   const key = JSON.stringify(message);
   if (key !== s.lastSelection) {
     s.lastSelection = key;
@@ -571,12 +412,13 @@ function sendSelection() {
 
 /** The list under Watch: a tick box and a pop-out button per stream. */
 function renderScreenList() {
-  if (POPOUT) {
+  if (POPOUT_STREAM_ID) {
     return;
   }
 
   const sources = session?.state?.sources ?? [];
-  const key = JSON.stringify([sources.map((s) => [s.id, s.name, s.width, s.height, s.primary]), [...deselected], [...popouts.keys()]]);
+  // Everything the list shows, so that it is rebuilt exactly when it would look different.
+  const key = JSON.stringify([session !== null, sources.map((s) => [s.id, s.name, s.width, s.height, s.primary, s.screens]), [...deselected], [...popouts.keys()]]);
   if (key === screenListKey) {
     return;
   }
@@ -606,7 +448,8 @@ function renderScreenList() {
       } else {
         deselected.add(source.id);
       }
-      renderTiles();
+      render();
+      syncSelection();
     });
     const name = document.createElement('span');
     name.className = 'screen-name';
@@ -617,6 +460,7 @@ function renderScreenList() {
     button.type = 'button';
     button.dataset.source = source.id;
     button.textContent = poppedOut ? 'Bring back' : 'Pop out';
+    button.setAttribute('aria-label', `${button.textContent}: ${source.name}`);
     button.addEventListener('click', () => (poppedOut ? bringBack(source.id) : popOut(source.id)));
 
     const detail = document.createElement('span');
@@ -670,126 +514,50 @@ function popOut(id) {
 
   popouts.set(id, win);
   log(`${source.name} is in a window of its own`);
-  renderTiles();
+  render();
+  syncSelection();
 }
 
-function bringBack(id) {
-  const win = popouts.get(id);
-  popouts.delete(id);
+function closeWindow(win) {
   try {
     win?.close();
   } catch {
     // Already gone.
   }
-  log(`${sourceName(id)} is back in this window`);
-  renderTiles();
+}
+
+/** Ends a pop-out window: its screen is shown in this window again. */
+function bringBack(id) {
+  closeWindow(popouts.get(id));
+  screensBack([id]);
+}
+
+/** Screens whose pop-out windows have gone: they are shown here again. */
+function screensBack(ids) {
+  for (const id of ids) {
+    popouts.delete(id);
+    log(`${sourceName(id)} is back in this window`);
+  }
+  render();
+  syncSelection();
 }
 
 function closePopouts() {
-  for (const win of popouts.values()) {
-    try {
-      win.close();
-    } catch {
-      // Already gone.
-    }
-  }
+  popouts.forEach(closeWindow);
   popouts.clear();
 }
 
 // A pop-out that is closed (by its own button, the window's close box or anything else) returns its screen here.
 setInterval(() => {
-  let changed = false;
-  for (const [id, win] of popouts) {
-    if (win.closed) {
-      popouts.delete(id);
-      log(`${sourceName(id)} is back in this window`);
-      changed = true;
-    }
-  }
-  if (changed) {
-    renderTiles();
+  const closed = [...popouts].filter(([, win]) => win.closed).map(([id]) => id);
+  if (closed.length > 0) {
+    screensBack(closed);
   }
 }, 500);
 
 // ---------------------------------------------------------------------------------------------
-// PCM playback (JPEG mode)
-// ---------------------------------------------------------------------------------------------
-
-/**
- * Plays blocks of 16-bit 8 kHz PCM as they arrive. Each block is scheduled to start exactly where
- * the previous one ends, a little behind the moment of arrival so that late blocks leave no gap.
- */
-class PcmPlayer {
-  constructor() {
-    try {
-      // A context running at the stream's own rate plays consecutive blocks sample-exactly.
-      this.context = new AudioContext({ sampleRate: PCM_SAMPLE_RATE, latencyHint: 'interactive' });
-    } catch {
-      this.context = new AudioContext({ latencyHint: 'interactive' });
-    }
-    this.gain = this.context.createGain();
-    this.gain.connect(this.context.destination);
-    this.nextTime = 0;
-    this.setMuted(muted);
-  }
-
-  get suspended() {
-    return this.context.state === 'suspended';
-  }
-
-  /** Seconds of audio scheduled but not yet played. */
-  get buffered() {
-    return Math.max(0, this.nextTime - this.context.currentTime);
-  }
-
-  play(samples) {
-    const buffer = this.context.createBuffer(1, samples.length, PCM_SAMPLE_RATE);
-    const channel = buffer.getChannelData(0);
-    for (let i = 0; i < samples.length; i++) {
-      channel[i] = samples[i] / 32768;
-    }
-
-    const now = this.context.currentTime;
-    if (this.nextTime < now + 0.02) {
-      this.nextTime = now + 0.1; // starting, or caught up with the data: put 100 ms in hand
-    } else if (this.nextTime > now + 0.6) {
-      return; // far too much queued (the tab was throttled, or clocks differ): drop to catch up
-    }
-
-    const source = this.context.createBufferSource();
-    source.buffer = buffer;
-    source.connect(this.gain);
-    source.start(this.nextTime);
-    this.nextTime += buffer.duration;
-  }
-
-  setMuted(value) {
-    this.gain.gain.value = value ? 0 : 1;
-  }
-
-  resume() {
-    return this.context.resume();
-  }
-
-  close() {
-    this.context.close().catch(() => {});
-  }
-}
-
-// ---------------------------------------------------------------------------------------------
 // Connection
 // ---------------------------------------------------------------------------------------------
-
-/** A pop-out asks for its one stream and no audio as it connects, so it is never sent anything else. */
-function socketUrl(url) {
-  if (!POPOUT) {
-    return url;
-  }
-  const withSelection = new URL(url);
-  withSelection.searchParams.set('select', POPOUT);
-  withSelection.searchParams.set('audio', '0');
-  return withSelection.href;
-}
 
 function newPictureCounters() {
   return { decoding: false, pending: null, received: 0, shown: 0, skipped: 0, bytes: 0, width: 0, height: 0 };
@@ -804,7 +572,7 @@ function connect() {
   }
 
   disconnect();
-  if (!POPOUT) {
+  if (!POPOUT_STREAM_ID) {
     try {
       localStorage.setItem(URL_STORAGE_KEY, url);
     } catch {
@@ -816,13 +584,13 @@ function connect() {
     url,
     socket: null,
     socketOpened: false,
-    mediaStartedAt: performance.now(),
     openedAt: 0,
     bytesReceived: 0,
     state: null,
     lastSelection: '',
-    audioPending: null,       // {ids, until}: an audio device change sent but not yet confirmed
+    audioPending: null,       // {ids, request, until}: an audio device change sent but not yet confirmed
     audioError: null,         // why the last audio device change was refused
+    controlError: null,       // why the last other command or setting was refused
     // WebRTC (h264 mode)
     peer: null,
     signaling: Promise.resolve(),
@@ -833,14 +601,15 @@ function connect() {
     // WebSocket media (jpeg mode)
     pictures: new Map(),      // stream id -> counters
     pcm: null,
-    audio: { blocks: 0, samples: 0, bytes: 0, level: 0 },
+    pcmCounters: { blocks: 0, samples: 0, bytes: 0, level: 0 }, // PCM received (JPEG mode)
     statsTimer: 0,
-    previous: {},
+    rateMemory: {},           // the counters at the last statistics poll, for rates
     snapshot: { state: 'connecting' },
   };
 
   try {
-    s.socket = new WebSocket(socketUrl(url));
+    // A pop-out asks for its one stream and no audio as it connects, so it is never sent anything else.
+    s.socket = new WebSocket(POPOUT_STREAM_ID ? addressFor(url, POPOUT_STREAM_ID) : url);
   } catch (error) {
     setStatus('error', `That address cannot be used: ${error.message}`);
     return;
@@ -897,6 +666,13 @@ function send(message) {
   }
 }
 
+/** Sends a command or configure request with a new id, and returns the id. */
+function sendRequest(message) {
+  const id = ++lastRequestId;
+  send({ ...message, id });
+  return id;
+}
+
 async function handleMessage(s, data) {
   if (session !== s) {
     return;
@@ -915,14 +691,14 @@ async function handleMessage(s, data) {
       applyState(s, message);
     } else if (message.type === 'error') {
       log(message.message, 'error');
-      if (s.audioPending) {
-        // The refusal of the audio change just asked for: the list goes back to what is recorded.
+      if (s.audioPending && message.request === s.audioPending.request) {
+        // The audio change just asked for was refused: the list goes back to what is recorded.
         s.audioPending = null;
         s.audioError = message.message;
-        renderAudioDevices(s.state);
       } else {
-        showControlNote(message.message, 'error');
+        s.controlError = message.message;
       }
+      render();
     } else if (message.sdp) {
       if (message.type === 'offer') {
         await acceptOffer(s, message);
@@ -962,15 +738,12 @@ function disconnect() {
     // Already closed.
   }
   closePeer(s);
-  closePictures(s);
+  closeSocketMedia(s);
   closePopouts();
 
-  renderTiles();
-  el.pausedBadge.hidden = true;
   el.unmute.hidden = true;
   clearStats();
-  showControls(null);
-  updatePlaybackControls();
+  render();
 }
 
 /** One line under the page title that says what is going on right now. */
@@ -1008,7 +781,7 @@ function applyState(s, state) {
 
   const streaming = state.streaming.state;
   const mode = state.video.mode;
-  const sourceIds = state.sources.map((source) => source.id).join(',');
+  const sourcesChanged = !previous || previous.sources.map((source) => source.id).join(',') !== state.sources.map((source) => source.id).join(',');
 
   if (!previous || previous.streaming.state !== streaming) {
     log(`Streaming is ${streaming}`);
@@ -1016,7 +789,7 @@ function applyState(s, state) {
   if (!previous || previous.video.mode !== mode) {
     log(`Video method: ${mode === 'jpeg' ? 'JPEG pictures over the WebSocket' : 'H.264 over WebRTC'}`);
   }
-  if (!previous || previous.sources.map((source) => source.id).join(',') !== sourceIds) {
+  if (sourcesChanged) {
     log(`Streams: ${state.sources.map((source) => `${source.name} (${source.videoWidth} × ${source.videoHeight})`).join(', ') || 'none'}`);
 
     // Forget choices about streams that no longer exist, and close their windows.
@@ -1028,11 +801,7 @@ function applyState(s, state) {
     for (const [id, win] of [...popouts]) {
       if (!state.sources.some((source) => source.id === id)) {
         popouts.delete(id);
-        try {
-          win.close();
-        } catch {
-          // Already gone.
-        }
+        closeWindow(win);
       }
     }
   }
@@ -1054,26 +823,22 @@ function applyState(s, state) {
     s.audioPending = null;
   }
 
-  if (!previous || previous.streaming.state !== streaming || previous.video.mode !== mode || previous.sources.map((source) => source.id).join(',') !== sourceIds) {
-    s.mediaStartedAt = performance.now();
-  }
 
   // Each transport only lives while the capture client is using it.
   if (streaming === 'stopped' || mode !== 'h264') {
     closePeer(s);
   }
   if (streaming === 'stopped' || mode !== 'jpeg') {
-    closePictures(s);
+    closeSocketMedia(s);
   }
 
-  if (POPOUT) {
-    const source = state.sources.find((candidate) => candidate.id === POPOUT);
-    document.title = `${source?.name ?? POPOUT} – Capture Viewer`;
+  if (POPOUT_STREAM_ID) {
+    const source = state.sources.find((candidate) => candidate.id === POPOUT_STREAM_ID);
+    document.title = `${source?.name ?? POPOUT_STREAM_ID} – Capture Viewer`;
   }
 
-  el.pausedBadge.hidden = streaming !== 'paused';
-  renderTiles();
-  showControls(state);
+  render();
+  syncSelection();
   refreshStatus(s);
 }
 
@@ -1135,15 +900,11 @@ function showControls(state) {
     setValue(el.frameRate, state.video.frameRate);
   }
 
-  if (!state) {
-    showControlNote('Connect to control the capture client.');
-  } else if (!state.remoteControl) {
-    showControlNote('Remote control is turned off on the capture client.');
-  } else if (el.controlNote.dataset.kind !== 'error') {
-    showControlNote('');
-  }
-
-  renderAudioDevices(state);
+  // Why the panel cannot be used, or why the last request was refused.
+  const error = enabled ? session?.controlError ?? null : null;
+  showControlNote(!state ? 'Connect to control the capture client.'
+    : !state.remoteControl ? 'Remote control is turned off on the capture client.'
+    : error ?? '', error ? 'error' : 'info');
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1154,10 +915,6 @@ function sameMembers(a = [], b = []) {
   return a.length === b.length && a.every((item) => b.includes(item));
 }
 
-function isDefaultEntry(device) {
-  return DEFAULT_DEVICE_IDS.includes(device.id);
-}
-
 /** What is selected as far as this page knows: a change it asked for counts before the capture client confirms it. */
 function audioSelection(s) {
   return s?.audioPending?.ids ?? s?.state?.audio?.selected ?? [];
@@ -1165,7 +922,7 @@ function audioSelection(s) {
 
 /** "the default recording device (Microphone (USB Audio))", or the device's name. */
 function audioDeviceLabel(device) {
-  if (isDefaultEntry(device)) {
+  if (isDefaultDeviceEntry(device)) {
     const kind = device.kind === 'input' ? 'recording' : 'playback';
     return device.device ? `the default ${kind} device (${device.device})` : `the default ${kind} device`;
   }
@@ -1183,7 +940,7 @@ function describeAudioSelection(audio) {
 /** The line under a device's name: which device a default entry is, and how a selected device is doing. */
 function describeAudioDevice(device, selected) {
   const parts = [];
-  if (isDefaultEntry(device)) {
+  if (isDefaultDeviceEntry(device)) {
     parts.push(device.device ?? `there is no ${device.kind === 'input' ? 'recording' : 'playback'} device`);
   } else {
     if (device.default) {
@@ -1220,8 +977,8 @@ function audioDeviceItem(device, selected, canChange) {
   box.addEventListener('change', () => chooseAudioDevice(device, box.checked));
 
   const name = document.createElement('span');
-  name.className = isDefaultEntry(device) ? 'device-name stand-in' : 'device-name';
-  name.textContent = isDefaultEntry(device) ? 'Default device' : device.name;
+  name.className = isDefaultDeviceEntry(device) ? 'device-name stand-in' : 'device-name';
+  name.textContent = isDefaultDeviceEntry(device) ? 'Default device' : device.name;
   label.append(box, name);
 
   const detail = document.createElement('span');
@@ -1287,23 +1044,31 @@ function chooseAudioDevice(device, record) {
   }
 
   // Until the capture client confirms, the page shows what was asked for, and a second click builds on it.
-  s.audioPending = { ids, until: performance.now() + 3000 };
-  s.audioError = null;
   log(`Request: ${record ? 'record' : 'stop recording'} ${audioDeviceLabel(device)}`);
-  send({ type: 'configure', audioDevices: ids });
-  renderAudioDevices(s.state);
+  const request = sendRequest(configureMessage({ audioDevices: ids }));
+  s.audioPending = { ids, request, until: performance.now() + 3000 };
+  s.audioError = null;
+  render();
+}
+
+/** A new request: the refusal of the last one no longer applies. */
+function clearControlError() {
+  if (session?.controlError) {
+    session.controlError = null;
+    render();
+  }
 }
 
 function sendCommand(target, action) {
-  showControlNote('');
+  clearControlError();
   log(`Request: ${action} ${target}`);
-  send({ type: 'command', target, action });
+  sendRequest(commandMessage(target, action));
 }
 
 function configure(setting, value) {
-  showControlNote('');
+  clearControlError();
   log(`Request: ${setting} = ${value}`);
-  send({ type: 'configure', [setting]: value });
+  sendRequest(configureMessage({ [setting]: value }));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1316,7 +1081,7 @@ async function acceptOffer(s, offer) {
   const peer = new RTCPeerConnection();
   s.peer = peer;
   s.peerConnectedAt = 0;
-  s.previous = {};
+  s.rateMemory = {};
   const sourceByMid = new Map(Object.entries(offer.sources ?? {}));
   log(`Offer received (${sourceByMid.size} video stream${sourceByMid.size === 1 ? '' : 's'}${/^m=audio/m.test(offer.sdp) ? ' and audio' : ''})`);
 
@@ -1345,7 +1110,7 @@ async function acceptOffer(s, offer) {
   for (const transceiver of peer.getTransceivers()) {
     const track = transceiver.receiver.track;
     if (track.kind === 'audio') {
-      if (!POPOUT) {
+      if (!POPOUT_STREAM_ID) {
         playAudio(track);
       }
     } else if (sourceByMid.has(transceiver.mid)) {
@@ -1358,7 +1123,7 @@ async function acceptOffer(s, offer) {
       transceiver.receiver.jitterBufferTarget = 0;
     }
   }
-  renderTiles();
+  render(); // the tiles get their tracks
 
   for (const candidate of s.earlyCandidates.splice(0)) {
     await peer.addIceCandidate(candidate);
@@ -1378,17 +1143,17 @@ function closePeer(s) {
   s.earlyCandidates = [];
   s.tracks.clear();
   s.trackToSource.clear();
-  el.audio.srcObject = null;
+  el.webrtcAudio.srcObject = null;
   for (const tile of tiles.values()) {
     tile.attach(null);
   }
 }
 
 async function playAudio(track) {
-  el.audio.srcObject = new MediaStream([track]);
-  el.audio.muted = muted;
+  el.webrtcAudio.srcObject = new MediaStream([track]);
+  el.webrtcAudio.muted = muted;
   try {
-    await el.audio.play();
+    await el.webrtcAudio.play();
   } catch (error) {
     if (error.name === 'NotAllowedError') {
       // The browser will not start sound without a click on the page; offer a button.
@@ -1403,15 +1168,13 @@ async function playAudio(track) {
 // ---------------------------------------------------------------------------------------------
 
 function handleMedia(s, buffer) {
-  if (buffer.byteLength < HEADER_LENGTH || s.state?.video.mode !== 'jpeg') {
+  const message = parseMediaMessage(buffer);
+  if (!message || s.state?.video.mode !== 'jpeg') {
     return;
   }
 
-  const header = new DataView(buffer);
-  const type = header.getUint8(0);
-  if (type === PICTURE_MESSAGE) {
-    const number = header.getUint8(1);
-    const source = s.state.sources.find((candidate) => candidate.number === number);
+  if (message.type === PICTURE_MESSAGE) {
+    const source = s.state.sources.find((candidate) => candidate.number === message.number);
     if (!source) {
       return; // a stream from before a layout change
     }
@@ -1421,10 +1184,10 @@ function handleMedia(s, buffer) {
       s.pictures.set(source.id, counters);
     }
     counters.received++;
-    counters.bytes += buffer.byteLength - HEADER_LENGTH;
-    showPicture(s, source.id, counters, new Uint8Array(buffer, HEADER_LENGTH));
-  } else if (type === AUDIO_MESSAGE && !POPOUT) {
-    playPcm(s, new Int16Array(buffer.slice(HEADER_LENGTH)));
+    counters.bytes += message.payload.byteLength;
+    showPicture(s, source.id, counters, message.payload);
+  } else if (message.type === AUDIO_MESSAGE && !POPOUT_STREAM_ID) {
+    playPcm(s, pcmSamples(message.payload));
   }
 }
 
@@ -1466,33 +1229,33 @@ async function showPicture(s, id, counters, jpeg) {
 
 function playPcm(s, samples) {
   if (!s.pcm) {
-    s.pcm = new PcmPlayer();
+    s.pcm = new PcmPlayer(s.state.audio.sampleRate, muted);
     el.unmute.hidden = !s.pcm.suspended;
   }
 
-  s.audio.blocks++;
-  s.audio.samples += samples.length;
-  s.audio.bytes += samples.byteLength;
+  s.pcmCounters.blocks++;
+  s.pcmCounters.samples += samples.length;
+  s.pcmCounters.bytes += samples.byteLength;
 
   let peak = 0;
   for (let i = 0; i < samples.length; i++) {
     peak = Math.max(peak, Math.abs(samples[i]));
   }
-  s.audio.level = Math.max(peak / 32768, s.audio.level * 0.8);
+  s.pcmCounters.level = Math.max(peak / 32768, s.pcmCounters.level * 0.8);
 
   s.pcm.play(samples);
 }
 
-function closePictures(s) {
-  if (!s.pcm && s.pictures.size === 0 && s.audio.blocks === 0) {
+function closeSocketMedia(s) {
+  if (!s.pcm && s.pictures.size === 0 && s.pcmCounters.blocks === 0) {
     return; // nothing was open
   }
 
   s.pcm?.close();
   s.pcm = null;
   s.pictures = new Map();
-  s.audio = { blocks: 0, samples: 0, bytes: 0, level: 0 };
-  s.previous = {};
+  s.pcmCounters = { blocks: 0, samples: 0, bytes: 0, level: 0 };
+  s.rateMemory = {};
   for (const tile of tiles.values()) {
     tile.clearPicture();
   }
@@ -1504,8 +1267,8 @@ function closePictures(s) {
 
 /** Per-second rate of a counter, from the difference to the previous poll. */
 function rateOf(s, key, value, timestamp) {
-  const previous = s.previous[key];
-  s.previous[key] = { value, timestamp };
+  const previous = s.rateMemory[key];
+  s.rateMemory[key] = { value, timestamp };
   if (value === undefined || !previous || timestamp <= previous.timestamp) {
     return undefined;
   }
@@ -1563,6 +1326,32 @@ function showTileInfo(perSource) {
   }
 }
 
+/**
+ * What the last statistics poll found. The panels show it, and the end-to-end test
+ * (tests/EndToEnd.ps1) reads it through window.captureViewer.stats, so these names are a contract.
+ * @typedef {object} StatsSnapshot
+ * @property {string} state              'connecting', 'connected', or the WebRTC connection's state
+ * @property {string|null} mode          the video mode
+ * @property {string|null} streaming     the streaming state
+ * @property {string|null} recording     the recording state
+ * @property {string|null} layout
+ * @property {string[]} tiles            the streams shown in this window
+ * @property {string[]} popouts          the streams in windows of their own
+ * @property {Object<string, number>} zoom   each tile's zoom, by stream id
+ * @property {Object<string, StreamStats>} sources   by stream id
+ * @property {object|null} video         totals over this window's tiles: streams, codec, framesPerSecond, bitsPerSecond, framesDecoded, ...
+ * @property {object|null} audio         codec, bitsPerSecond, packetsReceived, ...; null in a pop-out
+ *
+ * @typedef {object} StreamStats
+ * @property {number} width
+ * @property {number} height
+ * @property {number} framesPerSecond
+ * @property {number} bitsPerSecond
+ * @property {string} codec              'JPEG', or the WebRTC codec ('H.264 Constrained Baseline')
+ * @property {number} framesDecoded      pictures shown
+ * @property {number} framesDropped
+ */
+
 async function pollStats(s) {
   if (session !== s) {
     return;
@@ -1571,8 +1360,9 @@ async function pollStats(s) {
   const state = s.state;
   const mode = state?.video.mode;
   const streaming = state?.streaming.state;
+  /** @type {StatsSnapshot} */
   const snapshot = {
-    state: 'connected',
+    state: s.socketOpened ? 'connected' : 'connecting',
     mode: mode ?? null,
     streaming: streaming ?? null,
     recording: state?.recording.state ?? null,
@@ -1626,15 +1416,15 @@ function pollPictureStats(s, snapshot) {
   showVideoSummary(snapshot.video);
   showTileInfo(snapshot.sources);
 
-  const audioBits = rateOf(s, 'audioBits', s.audio.bytes * 8, now);
-  showStats('audio', s.audio.blocks === 0 ? null : {
+  const audioBits = rateOf(s, 'audioBits', s.pcmCounters.bytes * 8, now);
+  showStats('audio', s.pcmCounters.blocks === 0 ? null : {
     'Codec': 'PCM 16-bit, 8 kHz',
     'Bit rate': formatBitRate(audioBits),
-    'Packets received': formatCount(s.audio.blocks),
+    'Packets received': formatCount(s.pcmCounters.blocks),
     'Buffered': s.pcm ? formatMilliseconds(s.pcm.buffered) : EMPTY,
   });
-  el.level.value = s.audio.level;
-  s.audio.level *= 0.5;
+  el.level.value = s.pcmCounters.level;
+  s.pcmCounters.level *= 0.5;
 
   showStats('connection', {
     'Transport': 'WebSocket',
@@ -1643,12 +1433,12 @@ function pollPictureStats(s, snapshot) {
     'Connected for': formatDuration(now - s.openedAt),
   });
 
-  if (s.audio.blocks > 0) {
+  if (s.pcmCounters.blocks > 0) {
     snapshot.audio = {
       codec: 'PCM 16-bit, 8 kHz',
       bitsPerSecond: Math.round(audioBits ?? 0),
-      packetsReceived: s.audio.blocks,
-      totalSamplesReceived: s.audio.samples,
+      packetsReceived: s.pcmCounters.blocks,
+      totalSamplesReceived: s.pcmCounters.samples,
       bufferedSeconds: s.pcm ? Math.round(s.pcm.buffered * 1000) / 1000 : 0,
       contextState: s.pcm?.context.state ?? null,
     };
@@ -1688,7 +1478,7 @@ async function pollPeerStats(s, snapshot) {
   });
 
   for (const video of videos) {
-    const id = s.trackToSource.get(video.trackIdentifier) ?? [...s.tracks.keys()].find((key) => s.tracks.get(key)?.id === video.trackIdentifier);
+    const id = s.trackToSource.get(video.trackIdentifier);
     if (!id) {
       continue;
     }
@@ -1711,7 +1501,7 @@ async function pollPeerStats(s, snapshot) {
   showVideoSummary(snapshot.video);
   showTileInfo(snapshot.sources);
 
-  if (audio && !POPOUT) {
+  if (audio && !POPOUT_STREAM_ID) {
     const bitRate = rateOf(s, 'audio', audio.bytesReceived * 8, audio.timestamp);
     const codec = describeCodec(stats.get(audio.codecId));
     showStats('audio', {
@@ -1775,18 +1565,21 @@ el.frameRate.addEventListener('change', () => {
   if (Number.isInteger(value) && value >= 1 && value <= 60) {
     configure('frameRate', value);
   } else {
-    showControlNote('The frame rate has to be a whole number from 1 to 60.', 'error');
+    if (session) {
+      session.controlError = 'The frame rate has to be a whole number from 1 to 60.';
+      render();
+    }
   }
 });
 
 function setMuted(value) {
   muted = value;
-  el.audio.muted = value;
+  el.webrtcAudio.muted = value;
   session?.pcm?.setMuted(value);
   if (!value) {
     session?.pcm?.resume();
-    if (el.audio.srcObject) {
-      el.audio.play().catch(() => {});
+    if (el.webrtcAudio.srcObject) {
+      el.webrtcAudio.play().catch(() => {});
     }
   }
   el.unmute.hidden = true;
@@ -1813,18 +1606,17 @@ window.captureViewer = {
   },
 };
 
-if (POPOUT) {
+if (POPOUT_STREAM_ID) {
   document.body.classList.add('popout');
-  document.title = `${POPOUT} – Capture Viewer`;
+  document.title = `${POPOUT_STREAM_ID} – Capture Viewer`;
 }
 
 buildStatPanels();
-showControls(null);
-renderTiles();
+render();
 
 // ?url=ws://host:port/ presets the address; ?autoconnect connects on load.
 let initialUrl = parameters.get('url');
-if (!initialUrl && !POPOUT) {
+if (!initialUrl && !POPOUT_STREAM_ID) {
   try {
     initialUrl = localStorage.getItem(URL_STORAGE_KEY);
   } catch {

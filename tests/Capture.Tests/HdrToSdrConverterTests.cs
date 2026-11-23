@@ -5,8 +5,8 @@ namespace Capture.Tests;
 
 /// <summary>
 /// Feeds the converter the scRGB values Windows composes SDR content into in HDR mode, and checks
-/// that the original 8-bit values come back. Needs a Direct3D 11 graphics adapter; without one the
-/// tests pass without checking.
+/// that the original 8-bit values come back. They run on WARP, Windows' software rasterizer, so they
+/// need no graphics adapter and give the same answer on every machine.
 /// </summary>
 public sealed unsafe class HdrToSdrConverterTests : IDisposable
 {
@@ -19,10 +19,8 @@ public sealed unsafe class HdrToSdrConverterTests : IDisposable
 
     public HdrToSdrConverterTests()
     {
-        if (Direct3D.CreateDevice(IntPtr.Zero, out _device, out _context, out int featureLevel) < 0 || featureLevel < Direct3D.D3D_FEATURE_LEVEL_11_0)
-        {
-            Dispose();
-        }
+        int hr = Direct3D.CreateWarpDevice(out _device, out _context, out int featureLevel);
+        Assert.True(hr >= 0 && featureLevel >= Direct3D.D3D_FEATURE_LEVEL_11_0, $"No feature level 11 WARP device (0x{hr:X8}, level 0x{featureLevel:X}).");
     }
 
     public void Dispose()
@@ -37,11 +35,6 @@ public sealed unsafe class HdrToSdrConverterTests : IDisposable
     [InlineData(480)]
     public void Sdr_content_comes_back_with_the_values_it_was_drawn_with(double whiteLevel)
     {
-        if (_device == IntPtr.Zero)
-        {
-            return;
-        }
-
         using var converter = new HdrToSdrConverter(_device, _context, Width, Height);
         byte[] picture = Convert(converter, Composed(whiteLevel), whiteLevel);
 
@@ -58,11 +51,6 @@ public sealed unsafe class HdrToSdrConverterTests : IDisposable
     [Fact]
     public void Light_beyond_sdr_white_is_clipped_to_white_and_colours_outside_srgb_to_black()
     {
-        if (_device == IntPtr.Zero)
-        {
-            return;
-        }
-
         using var converter = new HdrToSdrConverter(_device, _context, Width, Height);
         byte[] picture = Convert(converter, Composed(240), 240);
 
@@ -75,11 +63,6 @@ public sealed unsafe class HdrToSdrConverterTests : IDisposable
     [Fact]
     public void A_change_of_white_level_applies_to_the_image_already_loaded()
     {
-        if (_device == IntPtr.Zero)
-        {
-            return;
-        }
-
         using var converter = new HdrToSdrConverter(_device, _context, Width, Height);
         Convert(converter, Composed(240), 240);
 

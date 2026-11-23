@@ -37,6 +37,7 @@ internal static unsafe class Direct3D
 
     private const int D3D_DRIVER_TYPE_UNKNOWN = 0;
     private const int D3D_DRIVER_TYPE_HARDWARE = 1;
+    private const int D3D_DRIVER_TYPE_WARP = 5;
     private const uint D3D11_CREATE_DEVICE_BGRA_SUPPORT = 0x20;
     private const uint D3D11_SDK_VERSION = 7;
     private const uint D3DCOMPILE_OPTIMIZATION_LEVEL3 = 1 << 15;
@@ -159,6 +160,10 @@ internal static unsafe class Direct3D
         int driverType = adapter == IntPtr.Zero ? D3D_DRIVER_TYPE_HARDWARE : D3D_DRIVER_TYPE_UNKNOWN;
         return D3D11CreateDevice(adapter, driverType, IntPtr.Zero, D3D11_CREATE_DEVICE_BGRA_SUPPORT, IntPtr.Zero, 0, D3D11_SDK_VERSION, out device, out featureLevel, out context);
     }
+
+    /// <summary>A device on WARP, Windows' software rasterizer: feature level 11, on any machine, with or without a graphics adapter.</summary>
+    public static int CreateWarpDevice(out IntPtr device, out IntPtr context, out int featureLevel) =>
+        D3D11CreateDevice(IntPtr.Zero, D3D_DRIVER_TYPE_WARP, IntPtr.Zero, D3D11_CREATE_DEVICE_BGRA_SUPPORT, IntPtr.Zero, 0, D3D11_SDK_VERSION, out device, out featureLevel, out context);
 
     /// <summary>Compiles HLSL source with the system's d3dcompiler_47.dll; throws with the compiler's messages on failure.</summary>
     public static byte[] CompileShader(string source, string entryPoint, string target)

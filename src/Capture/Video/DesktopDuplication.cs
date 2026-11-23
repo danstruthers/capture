@@ -57,7 +57,7 @@ internal sealed unsafe class DesktopDuplication : IDisposable
     }
 
     /// <summary>True when the screen is in HDR mode and its picture is being converted to SDR.</summary>
-    public bool IsHdr => _converter is not null;
+    public bool ConvertsHdr => _converter is not null;
 
     /// <summary>For a screen in HDR mode: the brightness of SDR white in nits, which the conversion maps to full white.</summary>
     public double SdrWhiteLevel { get; private set; }
@@ -71,20 +71,19 @@ internal sealed unsafe class DesktopDuplication : IDisposable
     /// <summary>Starts duplicating <paramref name="display"/>; returns null and a reason when that is not possible.</summary>
     public static DesktopDuplication? TryCreate(DisplayInfo display, out string reason)
     {
-        if (IsHeld(display))
+        // Claimed before trying, in one step, so that two streams can never both try the same screen.
+        if (!s_held.TryAdd(display.DeviceName, true))
         {
             reason = "this program is already duplicating it";
             return null;
         }
 
-        var duplication = new DesktopDuplication(display);
+        var duplication = new DesktopDuplication(display) { _heldScreen = display.DeviceName };
         try
         {
             reason = duplication.Initialize() ?? string.Empty;
             if (reason.Length == 0)
             {
-                s_held[display.DeviceName] = true;
-                duplication._heldScreen = display.DeviceName;
                 return duplication;
             }
         }
@@ -93,7 +92,7 @@ internal sealed unsafe class DesktopDuplication : IDisposable
             reason = ex.Message;
         }
 
-        duplication.Dispose();
+        duplication.Dispose(); // gives the claim back
         return null;
     }
 

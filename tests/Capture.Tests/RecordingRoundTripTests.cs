@@ -124,8 +124,8 @@ public sealed class RecordingRoundTripTests : IDisposable
     {
         using var rig = new Rig(Path.Combine(_directory, "never.mp4"));
 
-        Assert.Throws<InvalidOperationException>(rig.Recorder.Pause);
-        Assert.Throws<InvalidOperationException>(rig.Recorder.Resume);
+        Assert.Throws<RefusedException>(rig.Recorder.Pause);
+        Assert.Throws<RefusedException>(rig.Recorder.Resume);
         Assert.Equal(RecordingState.Stopped, rig.Recorder.State);
     }
 
@@ -179,7 +179,7 @@ public sealed class RecordingRoundTripTests : IDisposable
         using (var careful = new Mp4Recorder(_directory, path, null, overwrite: false, hasAudio: false))
         {
             careful.SetSources(sources);
-            InvalidOperationException error = Assert.Throws<InvalidOperationException>(careful.Start);
+            InvalidOperationException error = Assert.Throws<RefusedException>(careful.Start);
             Assert.Contains("--overwrite", error.Message);
             Assert.Equal(RecordingState.Stopped, careful.State);
         }
@@ -189,6 +189,22 @@ public sealed class RecordingRoundTripTests : IDisposable
         overwriting.Start();
         Assert.Equal(RecordingState.Recording, overwriting.State);
         overwriting.Stop();
+    }
+
+    [Fact]
+    public void A_refused_start_does_not_use_up_a_name()
+    {
+        string path = Path.Combine(_directory, "take.mp4");
+        File.WriteAllText(path, "not a video");
+        using var recorder = new Mp4Recorder(_directory, path, null, overwrite: false, hasAudio: false);
+        recorder.SetSources([new RecordingSource("screen1", () => TestFrames.Config, () => { })]);
+
+        Assert.Throws<RefusedException>(recorder.Start);
+        File.Delete(path); // the person moves the old file away and tries again
+
+        recorder.Start();
+        Assert.Equal(["take.mp4"], recorder.GetStatus().Files.Select(Path.GetFileName));
+        recorder.Stop();
     }
 
     [Fact]
@@ -333,7 +349,7 @@ public sealed class RecordingRoundTripTests : IDisposable
             {
                 Id = id;
                 _converter = new VideoConverter(TestFrames.Width, TestFrames.Height, TestFrames.Width, TestFrames.Height, TestFrames.Fps, MFMediaType.NV12, TestFrames.Config.Bt709);
-                Encoder = H264Encoder.CreateSoftware(TestFrames.Config);
+                Encoder = H264Encoders.CreateSoftware(TestFrames.Config);
                 Encoder.FrameEncoded += frame => recorder.WriteVideo(id, frame);
             }
 

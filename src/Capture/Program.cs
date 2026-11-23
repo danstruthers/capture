@@ -154,7 +154,7 @@ internal static class Program
 
         Console.WriteLine();
         Console.WriteLine("H.264 encoders (--encoder):");
-        IReadOnlyList<string> hardware = H264Encoder.ListHardwareEncoders();
+        IReadOnlyList<string> hardware = H264Encoders.ListHardware();
         foreach (string name in hardware)
         {
             Console.WriteLine($"  hardware: {name}");
@@ -165,6 +165,6 @@ internal static class Program
             Console.WriteLine("  hardware: (none found)");
         }
 
-        Console.WriteLine("  software: Microsoft H264 Encoder MFT");
+        Console.WriteLine($"  software: {H264Encoders.SoftwareEncoderName}");
     }
 }

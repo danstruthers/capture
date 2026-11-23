@@ -4,52 +4,35 @@ using Capture.Video;
 namespace Capture.Tests;
 
 /// <summary>
-/// Needs an interactive desktop. Where desktop duplication is not available (a service session,
-/// some remote sessions) the comparisons have nothing to compare and the tests pass without checking.
+/// Screen capture on this machine's own screens: desktop duplication against GDI, composing the
+/// desktop, and handing screens over between capturers. Each test is skipped, saying why, where
+/// the machine lacks what it needs (an interactive desktop, desktop duplication, several screens).
 /// </summary>
 public class ScreenCaptureTests
 {
     private const int Grid = 8;
 
-    [Fact]
+    [FactNeeding(Needs.DesktopDuplication)]
     public void Desktop_duplication_and_gdi_capture_the_same_picture_of_the_primary_screen()
     {
-        NativeMethods.EnableDpiAwareness();
-        DisplayInfo primary = DisplayInfo.Enumerate().First(display => display.IsPrimary);
+        DisplayInfo primary = Machine.Displays.First(display => display.IsPrimary);
 
         CompareMethods(CaptureArea.ForScreen(primary));
     }
 
-    [Fact]
+    [FactNeeding(Needs.DesktopDuplication | Needs.TwoScreens)]
     public void Desktop_duplication_and_gdi_compose_the_whole_desktop_the_same_way()
     {
-        NativeMethods.EnableDpiAwareness();
-        IReadOnlyList<DisplayInfo> displays = DisplayInfo.Enumerate();
-        if (displays.Count < 2)
-        {
-            return; // nothing to compose on a single-screen machine
-        }
-
-        CompareMethods(CaptureArea.ForDesktop(displays));
+        CompareMethods(CaptureArea.ForDesktop(Machine.Displays));
     }
 
-    [Fact]
+    [FactNeeding(Needs.DesktopDuplication)]
     public void A_new_capturer_takes_over_desktop_duplication_from_the_one_it_replaces()
     {
         // A layout change builds the new streams while the old ones still hold the screens, and a
         // process can only duplicate a screen once at a time.
-        NativeMethods.EnableDpiAwareness();
-        CaptureArea area = CaptureArea.ForScreen(DisplayInfo.Enumerate().First(display => display.IsPrimary));
-
-        ScreenCapturer old;
-        try
-        {
-            old = new ScreenCapturer(area, drawCursor: false, CaptureMethod.Dxgi);
-        }
-        catch (InvalidOperationException)
-        {
-            return; // no desktop duplication in this session
-        }
+        CaptureArea area = CaptureArea.ForScreen(Machine.Displays.First(display => display.IsPrimary));
+        ScreenCapturer old = new(area, drawCursor: false, CaptureMethod.Dxgi);
 
         ScreenCapturer replacement;
         using (old)
@@ -65,28 +48,23 @@ public class ScreenCaptureTests
         }
     }
 
-    [Fact]
+    [FactNeeding(Needs.DesktopWithGaps)]
     public unsafe void Parts_of_the_desktop_no_screen_covers_stay_black()
     {
-        NativeMethods.EnableDpiAwareness();
-        CaptureArea desktop = CaptureArea.ForDesktop(DisplayInfo.Enumerate());
-        (int x, int y)? uncovered = FindUncoveredPixel(desktop);
-        if (uncovered is null)
-        {
-            return; // the screens fill the desktop rectangle
-        }
+        CaptureArea desktop = CaptureArea.ForDesktop(Machine.Displays);
+        (int x, int y)? uncovered = Machine.FindUncoveredPixel(desktop);
 
         using var capturer = new ScreenCapturer(desktop, drawCursor: true, CaptureMethod.Auto);
         Assert.True(capturer.Capture(out _));
 
-        uint pixel = *(uint*)(capturer.Pixels + uncovered.Value.y * capturer.Stride + uncovered.Value.x * 4);
+        uint pixel = *(uint*)(capturer.Pixels + uncovered!.Value.y * capturer.Stride + uncovered.Value.x * 4);
         Assert.Equal(0u, pixel);
     }
 
-    [Fact]
+    [FactNeeding(Needs.Screen)]
     public void Windows_reports_an_sdr_content_brightness_for_every_screen()
     {
-        foreach (DisplayInfo display in DisplayInfo.Enumerate())
+        foreach (DisplayInfo display in Machine.Displays)
         {
             // The setting's range in Windows' display settings is 80 to 480 nits.
             double? whiteLevel = DisplayConfig.GetSdrWhiteLevel(display.DeviceName);
@@ -97,37 +75,9 @@ public class ScreenCaptureTests
         Assert.Null(DisplayConfig.GetSdrWhiteLevel(@"\\.\DISPLAY99"));
     }
 
-    private static (int X, int Y)? FindUncoveredPixel(CaptureArea area)
-    {
-        for (int y = 0; y < area.Height; y += 16)
-        {
-            for (int x = 0; x < area.Width; x += 16)
-            {
-                int desktopX = area.Left + x;
-                int desktopY = area.Top + y;
-                if (!area.Displays.Any(d => desktopX >= d.Left && desktopX < d.Right && desktopY >= d.Top && desktopY < d.Bottom))
-                {
-                    return (x, y);
-                }
-            }
-        }
-
-        return null;
-    }
-
     private static void CompareMethods(CaptureArea area)
     {
-        ScreenCapturer duplication;
-        try
-        {
-            duplication = new ScreenCapturer(area, drawCursor: false, CaptureMethod.Dxgi);
-        }
-        catch (InvalidOperationException)
-        {
-            return;
-        }
-
-        using (duplication)
+        using (var duplication = new ScreenCapturer(area, drawCursor: false, CaptureMethod.Dxgi))
         using (var gdi = new ScreenCapturer(area, drawCursor: false, CaptureMethod.Gdi))
         {
             Assert.Equal("DXGI desktop duplication", duplication.Method);

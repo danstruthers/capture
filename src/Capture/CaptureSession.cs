@@ -1,5 +1,3 @@
-using System.Globalization;
-using System.Text.Json;
 using Capture.Audio;
 using Capture.Output;
 using Capture.Video;
@@ -16,9 +14,20 @@ namespace Capture;
 /// or what they watch changes, the session works out which streams are in use and switches each
 /// one's capture on or off to match.
 /// </para>
+/// <para>
+/// Threads: requests arrive on the server's threads, and the recorder and the server report their
+/// changes on whichever thread made them. None of those threads acts on a change: each only
+/// signals the session's update thread, which then works out what has to run
+/// (<see cref="UpdateDemand"/>) and sends viewers the state, once for a burst of changes and at
+/// least once a second. So no class calls back into another while holding a lock of its own.
+/// <c>_layoutLock</c> serializes changes to the set of streams: layout, frame rate and shutdown.
+/// </para>
 /// </summary>
 internal sealed class CaptureSession : IRemoteControl, IDisposable
 {
+    /// <summary>How often viewers get the state even when nothing changed: the recording time and the viewer counts keep moving.</summary>
+    private static readonly TimeSpan StateInterval = TimeSpan.FromSeconds(1);
+
     private readonly Options _options;
     private readonly MediaClock _clock = new();
     private readonly VideoSettings _videoSettings;
@@ -26,30 +35,29 @@ internal sealed class CaptureSession : IRemoteControl, IDisposable
     private readonly Mp4Recorder _recorder;
     private readonly StreamServer? _server;
     private readonly object _layoutLock = new();
-    private readonly object _demandLock = new();
-    private readonly Dictionary<string, VideoStats> _lastStats = [];
     private readonly object _audioDeviceLock = new();
+
+    // Not disposed: a late change notification may still signal it while the session shuts down.
+    private readonly AutoResetEvent _changed = new(false);
+    private readonly Thread _updateThread;
 
     private volatile VideoPipeline[] _pipelines = [];
     private volatile int _frameRate;
     private ScreenLayout _layout;
     private IReadOnlyList<DisplayInfo> _displays;
-    private Timer? _statsTimer;
-    private Timer? _stateTimer;
+    private StatusLine? _statusLine;
     private IReadOnlyList<AudioDeviceInfo> _audioDevices = [];
     private long? _audioDevicesListedAt;
-    private long _lastAudioFrames;
-    private long _lastStatsTime;
-    private bool _wasIdle;
     private bool _started;
     private int _faulted;
-    private bool _disposed;
+    private volatile bool _disposed;
 
     public CaptureSession(Options options)
     {
         _options = options;
         _frameRate = options.Fps;
         _layout = options.Layout;
+        _updateThread = new Thread(UpdateLoop) { IsBackground = true, Name = "session-updates" };
         _videoSettings = new VideoSettings(
             options.Fps,
             options.BitrateKbps * 1000,
@@ -86,7 +94,7 @@ internal sealed class CaptureSession : IRemoteControl, IDisposable
 
             if (options.Server)
             {
-                var settings = new StreamSettings(options.Bind, options.Port, options.AllowedOrigins, options.Stun, options.Profile);
+                var settings = new StreamSettings(options.Bind, options.Port, options.AllowedOrigins, options.Stun, options.Profile, options.RemoteControl);
                 StreamingState initial = options.Stream ? StreamingState.Streaming : StreamingState.Stopped;
                 _server = new StreamServer(settings, this, initial, options.VideoMode, _audio is not null);
                 _server.Changed += OnStateChanged;
@@ -117,13 +125,10 @@ internal sealed class CaptureSession : IRemoteControl, IDisposable
 
     public Exception? Failure { get; private set; }
 
-    bool IRemoteControl.Enabled => _options.RemoteControl;
-
     public void Start()
     {
         if (_server is not null)
         {
-            SipSorceryLogging.Install();
             _server.Start();
             string host = _options.Bind.Equals(System.Net.IPAddress.Any) ? "<this machine>" : _options.Bind.ToString();
             string control = _options.RemoteControl ? "watch and control" : "watch";
@@ -151,162 +156,82 @@ internal sealed class CaptureSession : IRemoteControl, IDisposable
             Log.Info("Recording is off until a viewer starts it.");
         }
 
-        UpdateDemand();
+        _changed.Set(); // the first update: switch on what is already needed
+        _updateThread.Start();
 
         if (_options.StatsSeconds > 0)
         {
             TimeSpan interval = TimeSpan.FromSeconds(_options.StatsSeconds);
-            _lastStatsTime = _clock.Now;
-            _statsTimer = new Timer(_ => PrintStats(), null, interval, interval);
-        }
-
-        if (_server is not null)
-        {
-            // Keeps the figures viewers see (recording time and size, viewer counts) moving.
-            _stateTimer = new Timer(_ => BroadcastState(), null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
+            _statusLine = new StatusLine(interval, _clock, () => _pipelines, _recorder, _audio, _server);
         }
     }
 
-    public string GetStateJson()
+    public StateMessage GetState()
     {
-        VideoPipeline[] pipelines = _pipelines;
         RecordingStatus recording = _recorder.GetStatus();
-
-        return JsonSerializer.Serialize(new
-        {
-            type = "state",
-            remoteControl = _options.RemoteControl,
-            layout = _layout.ToString().ToLowerInvariant(),
-            recording = new
-            {
-                state = recording.State.ToString().ToLowerInvariant(),
-                files = recording.Files.Select(Path.GetFileName).ToArray(),
-                seconds = Math.Round(recording.Duration / (double)MediaClock.TicksPerSecond, 1),
-                bytes = recording.Bytes,
-            },
-            streaming = new
-            {
-                state = (_server?.State ?? StreamingState.Stopped).ToString().ToLowerInvariant(),
-                viewers = _server?.ViewerCount ?? 0,
-                clients = _server?.ClientCount ?? 0,
-            },
-            video = new
-            {
-                mode = (_server?.Mode ?? _options.VideoMode).ToString().ToLowerInvariant(),
-                frameRate = _frameRate,
-                jpegQuality = _options.JpegQuality,
-            },
-            sources = pipelines.Select(pipeline =>
-            {
-                CaptureArea area = pipeline.Area;
-                H264EncoderConfig config = pipeline.Config;
-                return new
-                {
-                    id = area.Id,
-                    number = area.Number,
-                    name = area.Name,
-                    screens = area.Displays.Select(display => display.Number).ToArray(),
-                    primary = area.IsPrimary,
-                    left = area.Left,
-                    top = area.Top,
-                    width = area.Width,
-                    height = area.Height,
-                    videoWidth = config.Width,
-                    videoHeight = config.Height,
-                    bitrateKbps = config.BitrateBps / 1000,
-                    capturing = pipeline.IsCapturing,
-                    viewers = _server?.ViewersOf(area.Id) ?? 0,
-                    capture = pipeline.CaptureMethod,
-                    encoder = pipeline.EncoderName,
-                    hardware = pipeline.EncoderIsHardware,
-                };
-            }).ToArray(),
-            audio = DescribeAudio(),
-        });
+        return new StateMessage(
+            RemoteControl: _options.RemoteControl,
+            Layout: _layout,
+            Recording: new RecordingInfo(
+                recording.State,
+                [.. recording.Files.Select(file => Path.GetFileName(file))],
+                Math.Round(recording.Duration / (double)MediaClock.TicksPerSecond, 1),
+                recording.Bytes),
+            Streaming: new StreamingInfo(_server?.State ?? StreamingState.Stopped, _server?.ViewerCount ?? 0, _server?.ClientCount ?? 0),
+            Video: new VideoInfo(_server?.Mode ?? _options.VideoMode, _frameRate, _options.JpegQuality),
+            Sources: [.. _pipelines.Select(DescribeSource)],
+            Audio: DescribeAudio());
     }
 
-    public void Execute(string target, string action)
+    public void Execute(CommandRequest command)
     {
-        switch (target, action)
+        RefuseIfShuttingDown();
+        switch (command.Target, command.Action)
         {
-            case ("recording", "start"): _recorder.Start(); break;
-            case ("recording", "stop"): _recorder.Stop(); break;
-            case ("recording", "pause"): _recorder.Pause(); break;
-            case ("recording", "resume"): _recorder.Resume(); break;
-            case ("streaming", "start"): Server().StartStreaming(); break;
-            case ("streaming", "stop"): Server().StopStreaming(); break;
-            case ("streaming", "pause"): Server().PauseStreaming(); break;
-            case ("streaming", "resume"): Server().ResumeStreaming(); break;
-            default: throw new InvalidOperationException($"'{action} {target}' is not a command this capture client knows.");
+            case (CommandTarget.Recording, CommandAction.Start): _recorder.Start(); break;
+            case (CommandTarget.Recording, CommandAction.Stop): _recorder.Stop(); break;
+            case (CommandTarget.Recording, CommandAction.Pause): _recorder.Pause(); break;
+            case (CommandTarget.Recording, CommandAction.Resume): _recorder.Resume(); break;
+            case (CommandTarget.Streaming, CommandAction.Start): Server().StartStreaming(); break;
+            case (CommandTarget.Streaming, CommandAction.Stop): Server().StopStreaming(); break;
+            case (CommandTarget.Streaming, CommandAction.Pause): Server().PauseStreaming(); break;
+            case (CommandTarget.Streaming, CommandAction.Resume): Server().ResumeStreaming(); break;
         }
     }
 
-    public void Configure(JsonElement settings)
+    /// <summary>
+    /// Applies the settings of a "configure" request, which were all checked when it was read.
+    /// (Applying one can still be refused by what it needs, such as an audio device that cannot be opened.)
+    /// </summary>
+    public void Configure(ConfigureRequest settings)
     {
-        bool changed = false;
-
-        foreach (JsonProperty setting in settings.EnumerateObject())
+        RefuseIfShuttingDown();
+        if (settings.VideoMode is not null && _server is null)
         {
-            switch (setting.Name)
-            {
-                case "type":
-                    continue;
-
-                case "frameRate":
-                    if (!setting.Value.TryGetInt32(out int fps) || fps is < 1 or > 60)
-                    {
-                        throw new InvalidOperationException("The frame rate has to be a whole number from 1 to 60.");
-                    }
-
-                    SetFrameRate(fps);
-                    break;
-
-                case "videoMode":
-                    if (!Enum.TryParse(setting.Value.GetString(), ignoreCase: true, out VideoMode mode) || !Enum.IsDefined(mode))
-                    {
-                        throw new InvalidOperationException("The video mode has to be h264 or jpeg.");
-                    }
-
-                    Server().SetMode(mode);
-                    break;
-
-                case "layout":
-                    if (!Enum.TryParse(setting.Value.GetString(), ignoreCase: true, out ScreenLayout layout) || !Enum.IsDefined(layout))
-                    {
-                        throw new InvalidOperationException("The layout has to be separate or desktop.");
-                    }
-
-                    SetLayout(layout);
-                    break;
-
-                case "audioSource":
-                    if (setting.Value.ValueKind != JsonValueKind.String
-                        || !Enum.TryParse(setting.Value.GetString(), ignoreCase: true, out AudioSourceKind source)
-                        || !Enum.IsDefined(source))
-                    {
-                        throw new InvalidOperationException("The audio source has to be microphone, desktop, both or none.");
-                    }
-
-                    SetAudioSelection(AudioSelection.For(source));
-                    break;
-
-                case "audioDevices":
-                    if (setting.Value.ValueKind != JsonValueKind.Array || setting.Value.EnumerateArray().Any(entry => entry.ValueKind != JsonValueKind.String))
-                    {
-                        throw new InvalidOperationException("audioDevices has to be a list of the ids in the state's audio.devices.");
-                    }
-
-                    SetAudioSelection([.. setting.Value.EnumerateArray().Select(entry => entry.GetString()!)]);
-                    break;
-
-                default:
-                    throw new InvalidOperationException($"'{setting.Name}' is not a setting this capture client knows.");
-            }
-
-            changed = true;
+            throw new RefusedException("The capture client was started without its server (--no-server).");
         }
 
-        if (changed)
+        if (settings.FrameRate is { } fps)
+        {
+            SetFrameRate(fps);
+        }
+
+        if (settings.VideoMode is { } mode)
+        {
+            Server().SetMode(mode);
+        }
+
+        if (settings.Layout is { } layout)
+        {
+            SetLayout(layout);
+        }
+
+        if (settings.AudioDevices is { } entries)
+        {
+            SetAudioSelection(entries);
+        }
+
+        if (!settings.IsEmpty)
         {
             OnStateChanged();
         }
@@ -321,6 +246,9 @@ internal sealed class CaptureSession : IRemoteControl, IDisposable
     {
         lock (_layoutLock)
         {
+            // Checked under the lock that Dispose takes to dispose the streams: streams built after that would never be disposed.
+            RefuseIfShuttingDown();
+
             IReadOnlyList<DisplayInfo> displays;
             try
             {
@@ -328,7 +256,7 @@ internal sealed class CaptureSession : IRemoteControl, IDisposable
             }
             catch (ArgumentException ex)
             {
-                throw new InvalidOperationException(ex.Message, ex);
+                throw new RefusedException(ex.Message, ex);
             }
 
             if (layout == _layout && displays.SequenceEqual(_displays))
@@ -373,8 +301,13 @@ internal sealed class CaptureSession : IRemoteControl, IDisposable
         }
 
         _disposed = true;
-        _statsTimer?.Dispose();
-        _stateTimer?.Dispose();
+        _changed.Set();
+        if (_updateThread.IsAlive)
+        {
+            _updateThread.Join(TimeSpan.FromSeconds(2));
+        }
+
+        _statusLine?.Dispose();
 
         // Sources first, so the last frames reach the outputs before those are closed.
         var timer = System.Diagnostics.Stopwatch.StartNew();
@@ -413,12 +346,18 @@ internal sealed class CaptureSession : IRemoteControl, IDisposable
 
     private static string Describe(VideoMode mode) => mode == VideoMode.Jpeg ? "JPEG over WebSocket" : "H.264 over WebRTC";
 
+    private void RefuseIfShuttingDown()
+    {
+        if (_disposed)
+        {
+            throw new RefusedException("The capture client is shutting down.");
+        }
+    }
+
     private static string Describe(ScreenLayout layout) => layout == ScreenLayout.Desktop ? "whole-desktop" : "separate-screens";
 
-    private static string Format(double milliseconds) => milliseconds.ToString("0.0", CultureInfo.InvariantCulture);
-
     private StreamServer Server() =>
-        _server ?? throw new InvalidOperationException("The capture client was started without its server (--no-server).");
+        _server ?? throw new RefusedException("The capture client was started without its server (--no-server).");
 
     private VideoPipeline[] CreatePipelines(ScreenLayout layout, IReadOnlyList<DisplayInfo> displays)
     {
@@ -479,9 +418,34 @@ internal sealed class CaptureSession : IRemoteControl, IDisposable
         _server?.SetSources([.. pipelines.Select(p => new StreamSource(p.Area.Id, p.Area.Number, p.RequestKeyFrame))]);
     }
 
-    private void SetAudioSelection(string[] entries)
+    /// <summary>The "sources" part of the state: one stream.</summary>
+    private SourceInfo DescribeSource(VideoPipeline pipeline)
     {
-        AudioMixer audio = _audio ?? throw new InvalidOperationException("Audio is turned off on the capture client (--no-audio).");
+        CaptureArea area = pipeline.Area;
+        H264EncoderConfig config = pipeline.Config;
+        return new SourceInfo(
+            area.Id,
+            area.Number,
+            area.Name,
+            [.. area.Displays.Select(display => display.Number)],
+            area.IsPrimary,
+            area.Left,
+            area.Top,
+            area.Width,
+            area.Height,
+            config.Width,
+            config.Height,
+            config.BitrateBps / 1000,
+            pipeline.IsCapturing,
+            _server?.ViewersOf(area.Id) ?? 0,
+            pipeline.CaptureMethod,
+            pipeline.EncoderName,
+            pipeline.EncoderIsHardware);
+    }
+
+    private void SetAudioSelection(IReadOnlyList<string> entries)
+    {
+        AudioMixer audio = _audio ?? throw new RefusedException("Audio is turned off on the capture client (--no-audio).");
         IReadOnlyList<string> before = audio.Selection;
         audio.SetSelection(entries);
         if (!audio.Selection.SequenceEqual(before))
@@ -491,93 +455,21 @@ internal sealed class CaptureSession : IRemoteControl, IDisposable
     }
 
     /// <summary>The "audio" part of the state.</summary>
-    private object DescribeAudio()
+    private AudioInfo DescribeAudio()
     {
         if (_audio is null)
         {
-            return new { enabled = false, source = "none", selected = Array.Empty<string>(), description = (string?)null, sampleRate = PcmFormat.SampleRate, devices = Array.Empty<object>() };
+            return AudioInfo.Off;
         }
 
         IReadOnlyList<string> selection = _audio.Selection;
-        return new
-        {
-            enabled = true,
-            source = AudioSelection.AsSource([.. selection])?.ToString().ToLowerInvariant() ?? "devices",
-            selected = selection,
-            description = _audio.Description,
-            sampleRate = PcmFormat.SampleRate,
-            devices = ListAudioDevices(_audio),
-        };
-    }
-
-    /// <summary>
-    /// Every audio device a viewer can choose from: for each kind, the entry for Windows' default
-    /// device, the connected devices, and any selected device that is not connected. Each says
-    /// whether it is selected and how it is doing.
-    /// </summary>
-    private object[] ListAudioDevices(AudioMixer audio)
-    {
-        IReadOnlyList<AudioInputStatus> inputs = audio.GetInputs();
-        IReadOnlyList<AudioDeviceInfo> connected = ConnectedAudioDevices();
-        Dictionary<string, AudioInputStatus> statusOf = inputs.ToDictionary(input => input.Id, AudioDevices.IdComparer);
-
-        // A device can be recorded without its own entry being selected: through the default-device entry.
-        Dictionary<string, AudioInputStatus> capturing = inputs
-            .Where(input => input.State == AudioInputState.Capturing)
-            .DistinctBy(input => input.Device!.Id, AudioDevices.IdComparer)
-            .ToDictionary(input => input.Device!.Id, AudioDevices.IdComparer);
-
-        object Entry(string id, AudioDeviceKind kind, string name, bool present, bool isDefault = false, string? device = null)
-        {
-            statusOf.TryGetValue(id, out AudioInputStatus? status);
-            AudioInputStatus? live = status?.State == AudioInputState.Capturing ? status : capturing.GetValueOrDefault(id);
-            return new
-            {
-                id,
-                kind = kind == AudioDeviceKind.Input ? "input" : "output",
-                name,
-                device,
-                @default = isDefault,
-                present,
-                selected = status is not null,
-                status = status?.State switch
-                {
-                    AudioInputState.Idle => "idle",
-                    AudioInputState.Starting => "starting",
-                    AudioInputState.Unavailable => "unavailable",
-                    _ => live is not null ? "capturing" : "off",
-                },
-                problem = status?.Problem,
-                format = live?.Format,
-            };
-        }
-
-        var entries = new List<object>();
-        foreach (AudioDeviceKind kind in new[] { AudioDeviceKind.Input, AudioDeviceKind.Output })
-        {
-            // While capturing, the device actually recorded; otherwise the default as last listed, which is fresher.
-            string defaultEntry = AudioSelection.DefaultFor(kind);
-            AudioDeviceInfo? current = statusOf.GetValueOrDefault(defaultEntry) is { State: not AudioInputState.Idle } recorded
-                ? recorded.Device
-                : connected.FirstOrDefault(device => device.Kind == kind && device.IsDefault);
-            entries.Add(Entry(defaultEntry, kind, $"Default {AudioDevices.Describe(kind)}", present: current is not null, device: current?.Name));
-
-            foreach (AudioDeviceInfo device in connected.Where(device => device.Kind == kind))
-            {
-                entries.Add(Entry(device.Id, kind, device.Name, present: true, isDefault: device.IsDefault));
-            }
-
-            foreach (AudioInputStatus input in inputs)
-            {
-                bool missing = !AudioSelection.IsDefault(input.Id) && !connected.Any(device => AudioDevices.IdComparer.Equals(device.Id, input.Id));
-                if (missing && (input.Device?.Kind ?? AudioDeviceKind.Input) == kind)
-                {
-                    entries.Add(Entry(input.Id, kind, input.Device?.Name ?? input.Id, present: false));
-                }
-            }
-        }
-
-        return [.. entries];
+        return new AudioInfo(
+            Enabled: true,
+            Source: AudioSelection.AsSource([.. selection])?.ToString().ToLowerInvariant() ?? "devices",
+            Selected: selection,
+            Description: _audio.Description,
+            SampleRate: PcmFormat.SampleRate,
+            Devices: AudioDeviceList.Build(_audio.GetInputs(), ConnectedAudioDevices()));
     }
 
     /// <summary>The connected audio devices, listed again at most every two seconds: the state goes out every second.</summary>
@@ -606,47 +498,71 @@ internal sealed class CaptureSession : IRemoteControl, IDisposable
 
     private void SetFrameRate(int fps)
     {
-        if (fps == _frameRate)
+        // Under the layout lock: a layout change builds its new streams at _frameRate, and must see
+        // either the old rate (and get the change below) or the new one.
+        lock (_layoutLock)
         {
-            return;
-        }
+            if (fps == _frameRate)
+            {
+                return;
+            }
 
-        _frameRate = fps;
-        foreach (VideoPipeline pipeline in _pipelines)
-        {
-            pipeline.SetFrameRate(fps);
+            _frameRate = fps;
+            foreach (VideoPipeline pipeline in _pipelines)
+            {
+                pipeline.SetFrameRate(fps);
+            }
         }
 
         Log.Info($"Frame rate is now {fps} fps.");
     }
 
+    /// <summary>Something changed (on any thread, possibly under that thread's locks): only wakes the update thread.</summary>
     private void OnStateChanged()
     {
-        if (_disposed)
+        if (!_disposed)
         {
-            return;
+            _changed.Set();
         }
-
-        UpdateDemand();
-        BroadcastState();
     }
 
-    /// <summary>Switches capture on for exactly the streams and outputs that are in use right now.</summary>
-    private void UpdateDemand()
+    /// <summary>The update thread: see the class remarks.</summary>
+    private void UpdateLoop()
     {
-        lock (_demandLock)
+        while (!_disposed)
         {
-            bool recording = _recorder.WantsMedia;
-            foreach (VideoPipeline pipeline in _pipelines)
+            _changed.WaitOne(StateInterval);
+            if (_disposed)
             {
-                string id = pipeline.Area.Id;
-                pipeline.SetDemand(
-                    h264: recording || (_server?.WantsH264(id) ?? false),
-                    jpeg: _server?.WantsJpeg(id) ?? false);
+                return;
             }
 
-            _audio?.SetActive(recording || (_server?.WantsAudio ?? false));
+            try
+            {
+                UpdateDemand();
+                BroadcastState();
+            }
+            catch (Exception ex)
+            {
+                Log.Warn($"Bringing capture in line with its use failed: {ex.Message}");
+                Log.Debug(ex.ToString());
+            }
         }
+    }
+
+    /// <summary>Switches capture on for exactly the streams and outputs that are in use right now. Runs on the update thread only.</summary>
+    private void UpdateDemand()
+    {
+        bool recording = _recorder.WantsMedia;
+        foreach (VideoPipeline pipeline in _pipelines)
+        {
+            string id = pipeline.Area.Id;
+            pipeline.SetDemand(
+                h264: recording || (_server?.WantsH264(id) ?? false),
+                jpeg: _server?.WantsJpeg(id) ?? false);
+        }
+
+        _audio?.SetActive(recording || (_server?.WantsAudio ?? false));
     }
 
     private void BroadcastState()
@@ -675,112 +591,6 @@ internal sealed class CaptureSession : IRemoteControl, IDisposable
             Log.Debug(exception.ToString());
             Failure = exception;
             Faulted?.Invoke(exception);
-        }
-    }
-
-    private void PrintStats()
-    {
-        try
-        {
-            long now = _clock.Now;
-            double seconds = (now - _lastStatsTime) / (double)MediaClock.TicksPerSecond;
-            if (seconds <= 0)
-            {
-                return;
-            }
-
-            VideoPipeline[] pipelines = _pipelines;
-            RecordingStatus recording = _recorder.GetStatus();
-            var parts = new List<string>();
-            var current = new Dictionary<string, VideoStats>();
-
-            foreach (VideoPipeline pipeline in pipelines)
-            {
-                string id = pipeline.Area.Id;
-                VideoStats stats = pipeline.GetStats();
-                VideoStats last = _lastStats.GetValueOrDefault(id);
-                current[id] = stats;
-
-                long captured = stats.FramesCaptured - last.FramesCaptured;
-                if (captured == 0)
-                {
-                    continue;
-                }
-
-                long encoded = stats.FramesEncoded - last.FramesEncoded;
-                long pictures = stats.JpegFrames - last.JpegFrames;
-                long dropped = stats.FramesDropped - last.FramesDropped;
-
-                string line = $"{id} {captured / seconds:0.0} fps, capture {Format((stats.CaptureMs - last.CaptureMs) / captured)} ms";
-                if (encoded > 0)
-                {
-                    line += $", H.264 {(stats.BytesEncoded - last.BytesEncoded) * 8 / seconds / 1000:0} kbit/s " +
-                            $"(convert {Format((stats.ConvertMs - last.ConvertMs) / encoded)} ms, encode {Format((stats.EncodeMs - last.EncodeMs) / encoded)} ms)";
-                }
-
-                if (pictures > 0)
-                {
-                    line += $", JPEG {pictures / seconds:0.0} fps {(stats.JpegBytes - last.JpegBytes) * 8 / seconds / 1000:0} kbit/s " +
-                            $"({Format((stats.JpegMs - last.JpegMs) / pictures)} ms)";
-                }
-
-                if (dropped > 0)
-                {
-                    line += $", dropped {dropped}";
-                }
-
-                parts.Add(line);
-            }
-
-            _lastStats.Clear();
-            foreach ((string id, VideoStats stats) in current)
-            {
-                _lastStats[id] = stats;
-            }
-
-            bool idle = parts.Count == 0 && recording.State != RecordingState.Recording;
-            if (idle)
-            {
-                if (!_wasIdle)
-                {
-                    Log.Info("Idle: nothing is being recorded or watched, so nothing is being captured.");
-                }
-            }
-            else
-            {
-                if (_audio is not null)
-                {
-                    long audioFrames = _audio.FramesProduced;
-                    parts.Add($"audio {(audioFrames - _lastAudioFrames) * PcmFormat.SamplesPerFrame / seconds:0} samples/s");
-                    _lastAudioFrames = audioFrames;
-                }
-
-                if (_server is not null)
-                {
-                    parts.Add(_server.State switch
-                    {
-                        StreamingState.Stopped => "streaming stopped",
-                        StreamingState.Paused => "streaming paused",
-                        _ => $"streaming to {_server.ViewerCount} of {_server.ClientCount} clients",
-                    });
-                }
-
-                parts.Add(recording.State switch
-                {
-                    RecordingState.Stopped => "not recording",
-                    RecordingState.Paused => $"recording paused at {TimeSpan.FromTicks(recording.Duration):hh\\:mm\\:ss}",
-                    _ => $"recorded {TimeSpan.FromTicks(recording.Duration):hh\\:mm\\:ss}, {recording.Bytes / 1_048_576.0:0.0} MB",
-                });
-
-                Log.Info(string.Join(" | ", parts));
-            }
-
-            _wasIdle = idle;
-            _lastStatsTime = now;
-        }
-        catch (ObjectDisposedException)
-        {
-            // The timer fired while the session was shutting down.
         }
     }
 }

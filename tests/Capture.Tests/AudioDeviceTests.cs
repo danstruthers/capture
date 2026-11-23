@@ -4,7 +4,7 @@ namespace Capture.Tests;
 
 /// <summary>
 /// This PC's real audio devices: the list, looking devices up, and recording every one of them at
-/// once through the mixer. On a machine without audio devices the tests pass without checking.
+/// once through the mixer. Recording them is skipped on a machine without audio devices.
 /// </summary>
 [Collection(MediaFoundationCollection.Name)]
 public sealed class AudioDeviceTests
@@ -49,21 +49,20 @@ public sealed class AudioDeviceTests
         foreach (AudioDeviceInfo device in devices)
         {
             Assert.Equal(device, AudioDevices.Find(device.Number.ToString()));
-            Assert.Equal(device, AudioDevices.Find(device.Name.ToUpperInvariant()));
+            if (devices.Count(other => other.Name.Equals(device.Name, StringComparison.CurrentCultureIgnoreCase)) == 1)
+            {
+                Assert.Equal(device, AudioDevices.Find(device.Name.ToUpperInvariant())); // two devices of the same name need their numbers
+            }
         }
 
         Assert.Contains("does not exist", Assert.Throws<ArgumentException>(() => AudioDevices.Find((devices.Count + 1).ToString())).Message);
         Assert.Contains("No audio device", Assert.Throws<ArgumentException>(() => AudioDevices.Find("no device is called this")).Message);
     }
 
-    [Fact]
+    [FactNeeding(Needs.AudioDevices)]
     public void Every_device_can_be_recorded_at_once()
     {
         IReadOnlyList<AudioDeviceInfo> devices = AudioDevices.Enumerate();
-        if (devices.Count == 0)
-        {
-            return;
-        }
 
         string[] selection = [.. devices.Select(device => device.Id), AudioSelection.DefaultInput, AudioSelection.DefaultOutput];
         selection = [.. selection.Where(entry => AudioSelection.KindOfDefault(entry) is not { } kind || devices.Any(device => device.Kind == kind))];
@@ -80,7 +79,7 @@ public sealed class AudioDeviceTests
         Assert.All(inputs, input => Assert.Matches(@"^\d+ Hz, \d+ ch, \d+-bit (float|PCM)$", input.Format));
 
         // The default entries share their devices' sources: every device is in the mix once.
-        Assert.Equal(devices.Count, mixer.Description.Split(" + ").Length);
+        Assert.Equal(devices.Count, inputs.Select(input => input.Device!.Id).Distinct().Count());
 
         var deadline = DateTime.UtcNow.AddSeconds(3);
         while (mixer.FramesProduced < 25 && DateTime.UtcNow < deadline)

@@ -8,9 +8,10 @@ streams them to viewers, plus a single-page web viewer for testing and remote co
 - **Video**: H.264, encoded once per stream and used for both the MP4 files and the live stream.
   A hardware encoder is used when the machine has a working one; otherwise the Microsoft software
   encoder.
-- **Audio**: 16-bit linear PCM at 8 kHz mono, mixed from any number of audio devices: recording
-  devices (microphones, line in) and playback devices (recorded as what they play). By default,
-  the Windows default microphone.
+- **Audio**: mixed from any number of audio devices, recording devices (microphones, line in) and
+  playback devices (recorded as what they play), into 16-bit PCM at 8 kHz mono; by default, the
+  Windows default microphone. That is stored as AAC in the MP4 files and sent as G.711 over
+  WebRTC, or as the PCM itself over the WebSocket.
 - **Streaming**: WebRTC (H.264 + G.711), or as a fallback JPEG pictures and raw PCM over a WebSocket.
 - **Remote control**: viewers can start, stop, pause and resume recording and streaming, change the
   frame rate, switch the screen layout and the video method, and see every audio device and choose
@@ -62,10 +63,13 @@ capture --bind 0.0.0.0 --allow-origin http://192.168.1.20:5174   # viewers on ot
 
 ## Configuration
 
-Defaults come from `capture.json`, looked for in the current directory and then next to
+Settings can come from `capture.json`, looked for in the current directory and then next to
 `capture.exe`. Its keys are the command-line option names without the dashes (`videoMode` or
-`video-mode`), and the command line overrides the file. On/off options can be written `"record":
-false` in the file and `--record` / `--no-record` on the command line.
+`video-mode`), and the command line overrides the file; a list given on the command line
+(`--audio-device`, `--allow-origin`, `--screens`) replaces the file's. On/off options can be
+written `"record": false` in the file and `--record`, `--no-record` or `--record=false` on the
+command line. The `capture.json` that comes with the program has every setting commented out, so
+the program's own defaults apply until you change one.
 
 ```jsonc
 {
@@ -93,8 +97,10 @@ the capture client runs.
 
 ## The viewer
 
-`src/Capture.Viewer` is a small host that serves one static page (`wwwroot`: HTML, CSS and one
-JavaScript module, no build step or dependencies). The page talks to the capture client directly.
+`src/Capture.Viewer` is a small host that serves one static page (`wwwroot`: HTML, CSS and a few
+JavaScript modules, no build step or dependencies). The page talks to the capture client directly.
+`viewer.js` is the page; `protocol.js` has the messages, `zoom.js`, `pcm-player.js` and
+`format.js` the parts that stand on their own.
 
 - **Screens**: one tile per stream, arranged the way the screens are arranged on the desktop.
   Each tile shows its size, frame rate and bit rate.
@@ -205,38 +211,30 @@ JPEG pictures are far larger than H.264 frames: a full-size 2560×1440 screen at
 
 ## WebSocket protocol
 
-A client connects to `ws://<host>:8081/`. Text messages are JSON.
+A client connects to `ws://<host>:8081/`. Text messages are JSON, with camelCase names and
+values (`"h264"`). The code that defines them is
+[`ViewerProtocol.cs`](src/Capture/Output/ViewerProtocol.cs); this section describes the same.
 
 From the capture client:
 
 | Message | Meaning |
 |---|---|
-| `{"type":"state", "layout":"separate", "sources":[…], "recording":{…}, "streaming":{…}, "video":{…}, "audio":{…}, "remoteControl":true}` | Current state; sent on connect, on every change and once a second. |
-| `{"type":"error","message":"…"}` | A request was refused. |
+| `{"type":"state", "remoteControl":true, "layout":"separate", "recording":{…}, "streaming":{…}, "video":{…}, "sources":[…], "audio":{…}}` | Current state; sent on connect, on every change and once a second. |
+| `{"type":"error","message":"…","request":7}` | A request was refused, or failed. `message` is written for the person who asked; `request` is the request's `id`, if it had one. |
 | `{"type":"offer","sdp":"…","sources":{"1":"screen1","2":"screen2"}}` | WebRTC offer (H.264 mode), with the stream each video section (by `mid`) carries. Reply with the answer. |
 | `{"candidate":"…","sdpMid":"…","sdpMLineIndex":0}` | ICE candidate. |
 
-Each entry of `sources` describes one stream: `id` (`screen1`, `screen2`, … or `desktop`),
-`number` (the screen number, 0 for the desktop), `name`, `screens`, `primary`, its position and
-size on the desktop (`left`, `top`, `width`, `height`), the encoded size (`videoWidth`,
-`videoHeight`), `bitrateKbps`, whether it is being captured (`capturing`), how many clients
-receive it (`viewers`), and the capture method and encoder in use.
+The parts of the state:
 
-To the capture client:
-
-| Message | Meaning |
+| Part | Fields |
 |---|---|
-| `{"type":"select","sources":["screen1"],"audio":true}` | Which streams this client wants, and whether it wants sound. Until a client says, it gets everything. Allowed even when remote control is off. |
-| `{"type":"command","target":"recording","action":"start"}` | `target`: `recording` or `streaming`; `action`: `start`, `stop`, `pause`, `resume`. |
-| `{"type":"configure","frameRate":15}` | Also `"layout":"separate"\|"desktop"`, `"videoMode":"h264"\|"jpeg"`, `"audioDevices":["default-input","{0.0.0.00000000}.{…}"]` (exactly the devices to record) and `"audioSource":"microphone"\|"desktop"\|"both"\|"none"` (shorthand for the default devices). |
-| `{"type":"answer","sdp":"…"}` | WebRTC answer. |
-| `{"candidate":"…","sdpMid":"…","sdpMLineIndex":0}` | ICE candidate. |
+| `recording` | `state` (`stopped`, `recording`, `paused`), `files` (the file names being written), `seconds` (recorded, pauses left out), `bytes` |
+| `streaming` | `state` (`stopped`, `streaming`, `paused`), `viewers` (clients being sent media), `clients` (clients connected) |
+| `video` | `mode` (`h264` or `jpeg`), `frameRate`, `jpegQuality` |
+| each of `sources` | `id` (`screen1`, `screen2`, … or `desktop`), `number` (the screen number, 0 for the desktop), `name`, `screens`, `primary`, position and size on the desktop (`left`, `top`, `width`, `height`), the encoded size (`videoWidth`, `videoHeight`), `bitrateKbps`, `capturing` (whether anything uses it), `viewers` (clients receiving it), `capture` (the capture method), `encoder` and `hardware` |
+| `audio` | `enabled`, `selected` (the ids being recorded), `source` (`microphone`, `desktop`, `both` or `none` when the selection is just default devices, otherwise `devices`), `description`, `sampleRate`, `devices` |
 
-A client can also choose up front, in the address: `ws://host:8081/?select=screen2&audio=0`.
-
-The state's `audio` has `enabled`, `selected` (the ids being recorded), `source` (`microphone`,
-`desktop`, `both` or `none` when the selection is just default devices, otherwise `devices`),
-`description` and `devices`. Each entry of `devices` has:
+Each entry of `audio.devices`:
 
 - `id`: the Windows endpoint ID, or `default-input` / `default-output` for the entries that stand
   for Windows' default recording and playback device;
@@ -246,8 +244,19 @@ The state's `audio` has `enabled`, `selected` (the ids being recorded), `source`
 - `selected`, `status` (`off`, `idle`, `starting`, `capturing` or `unavailable`), `problem`
   (why it is unavailable) and `format` (what it delivers while captured).
 
-Selecting a device that cannot be recorded is refused with an `error` message, and the selection
-stays as it was.
+To the capture client:
+
+| Message | Meaning |
+|---|---|
+| `{"type":"select","sources":["screen1"],"audio":true}` | Which streams this client wants, and whether it wants sound. Until a client says, it gets everything. Allowed even when remote control is off. |
+| `{"type":"command","target":"recording","action":"start","id":7}` | `target`: `recording` or `streaming`; `action`: `start`, `stop`, `pause`, `resume`. |
+| `{"type":"configure","frameRate":15,"id":8}` | Also `"layout":"separate"\|"desktop"`, `"videoMode":"h264"\|"jpeg"`, `"audioDevices":["default-input","{0.0.0.00000000}.{…}"]` (exactly the devices to record) and `"audioSource":"microphone"\|"desktop"\|"both"\|"none"` (shorthand for the default devices). Every setting is checked before any is applied: a request with a mistake in it changes nothing. |
+| `{"type":"answer","sdp":"…"}` | WebRTC answer. |
+| `{"candidate":"…","sdpMid":"…","sdpMLineIndex":0}` | ICE candidate. |
+
+`id` is optional; an `error` refusing the request carries it back, so a client can tell which of
+its requests failed. A client can also choose up front, in the address:
+`ws://host:8081/?select=screen2&audio=0`.
 
 In JPEG mode, media arrives as binary messages: a type byte, the stream number, a 64-bit
 little-endian timestamp in 100 ns units, then the payload.
@@ -279,7 +288,7 @@ the picture (colours, orientation), frame counts, durations, audio, one file per
 files after a change of streams. The screen capture tests compare desktop duplication with GDI,
 for one screen and for the composed desktop (on an HDR screen this checks the HDR conversion
 against what apps drew). The HDR conversion is also tested on its own with synthetic scRGB
-pictures, so it is covered on machines without an HDR screen.
+pictures, on WARP (Windows' software rasterizer), so it is covered on any machine.
 
 Hardware encoders cannot be tested on a machine without one, so the asynchronous encoder path is
 exercised with a simulated asynchronous transform wrapped around the software encoder
@@ -287,18 +296,28 @@ exercised with a simulated asynchronous transform wrapped around the software en
 
 The audio mixer is tested with stand-in devices (which devices are open when, default-device
 entries, refusals, slow devices, devices that stop or will not open, the mix itself) and with
-this PC's real devices: every connected device is recorded at once.
+this PC's real devices: every connected device is recorded at once. The viewer protocol (what is
+accepted and refused, the state's JSON, the binary framing), the origin check, RTP packetization
+and the command-line options have tests of their own.
+
+Some tests need things not every machine has: an interactive desktop, desktop duplication, two
+screens, audio devices. Without them those tests are reported as skipped, with the reason; they
+never pass without checking.
 
 The end-to-end test also chooses screens, zooms, pops a screen out into its own window and back,
-ticks and unticks audio devices, and switches between the two layouts.
+ticks and unticks audio devices, and switches between the two layouts. It runs the capture client
+with an empty configuration file, so a local `capture.json` does not change what it tests. When a
+check fails it shows the logs and keeps its output folder.
 
 ## Layout
 
 ```
-src/Capture/            the capture client
-  Video/                screens and capture areas, capture, conversion, H.264 and JPEG encoding, the video pipeline
+src/Capture/            the capture client: options, the capture session that wires it together, the status line
+  Video/                screens and capture areas, capture (desktop duplication, GDI, HDR conversion),
+                        conversion, H.264 encoders and JPEG, the video pipeline
   Audio/                audio devices and selection, recording-device and loopback sources, timeline, mixer, resampler
-  Output/               MP4 recorder, stream server (WebSocket, WebRTC, remote control)
+  Output/               MP4 recorder; stream server, one connection per viewer, WebRTC sessions, RTP
+                        packetization; the viewer protocol and the audio device list viewers see
   Interop/              Media Foundation helpers; ICodecAPI, Direct3D/DXGI, Core Audio (WASAPI) and Win32 declarations
 src/Capture.Viewer/     static host and the viewer page (wwwroot)
 tests/Capture.Tests/    unit and round-trip tests

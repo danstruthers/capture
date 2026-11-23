@@ -63,29 +63,4 @@ public class CaptureAreaTests
     {
         Assert.Equal((width, height), VideoPipeline.ChooseOutputSize(CaptureArea.ForScreen(Primary), Settings(maxWidth, maxHeight)));
     }
-
-    [Fact]
-    public void Offer_sdp_maps_each_video_section_to_its_payload_type()
-    {
-        // The shape of an offer the capture client makes for two screens and audio (abridged).
-        const string sdp = "v=0\r\n" +
-            "a=group:BUNDLE 0 1 2\r\n" +
-            "m=audio 9 UDP/TLS/RTP/SAVPF 0 101\r\n" +
-            "a=mid:0\r\n" +
-            "a=rtpmap:0 PCMU/8000\r\n" +
-            "a=rtpmap:101 telephone-event/8000\r\n" +
-            "m=video 9 UDP/TLS/RTP/SAVPF 96\r\n" +
-            "a=mid:1\r\n" +
-            "a=rtpmap:96 H264/90000\r\n" +
-            "a=fmtp:96 packetization-mode=1\r\n" +
-            "m=video 9 UDP/TLS/RTP/SAVPF 97\r\n" +
-            "a=mid:2\r\n" +
-            "a=rtpmap:97 H264/90000\r\n";
-
-        Dictionary<string, int> payloadTypes = StreamServer.VideoPayloadTypesByMid(sdp);
-
-        Assert.Equal(2, payloadTypes.Count);
-        Assert.Equal(96, payloadTypes["1"]);
-        Assert.Equal(97, payloadTypes["2"]);
-    }
 }

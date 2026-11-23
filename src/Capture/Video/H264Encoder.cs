@@ -59,12 +59,11 @@ internal sealed unsafe class H264Encoder : IDisposable
 
     private static readonly TimeSpan SelfTestTimeout = TimeSpan.FromSeconds(3);
 
-    private static int s_reportedSoftwareFallback;
-
     private readonly object _lock = new();
     private readonly H264EncoderConfig _config;
     private readonly IMFTransform _transform;
     private readonly IMFActivate? _activate;
+    private readonly bool _ownsActivate;
     private readonly ICodecAPI? _codecApi;
     private readonly bool _isAsync;
     private readonly bool _transformAllocatesOutput;
@@ -79,18 +78,19 @@ internal sealed unsafe class H264Encoder : IDisposable
     private long _framesSubmitted;
     private long _droppedInputs;
     private long _lastTimestamp = -1;
-    private byte[]? _sps;
-    private byte[]? _pps;
-    private byte[]? _sequenceHeader;
+    private readonly ParameterSets _parameterSets = new();
     private bool _forceKeyFrameUnsupported;
     private volatile bool _keyFrameRequested;
     private volatile Exception? _failure;
     private volatile bool _disposed;
 
-    internal H264Encoder(IMFTransform transform, IMFActivate? activate, string name, bool isHardware, H264EncoderConfig config)
+    /// <param name="activate">For a hardware encoder, the activation object it was created from; shut down when the encoder is.</param>
+    /// <param name="ownsActivate">Whether the activation object is also released with the encoder.</param>
+    internal H264Encoder(IMFTransform transform, IMFActivate? activate, string name, bool isHardware, H264EncoderConfig config, bool ownsActivate = false)
     {
         _transform = transform;
         _activate = activate;
+        _ownsActivate = ownsActivate;
         _config = config;
         _stallFrameLimit = Math.Max(config.Fps * 3, 30);
         Name = name;
@@ -156,60 +156,6 @@ internal sealed unsafe class H264Encoder : IDisposable
     /// <summary>Input frames discarded because an asynchronous encoder was not ready for them.</summary>
     public long DroppedInputs => Interlocked.Read(ref _droppedInputs);
 
-    /// <summary>
-    /// Creates the best available encoder: each hardware encoder MFT is tried in merit order and
-    /// must pass a short self-test; the Microsoft software encoder is the fallback.
-    /// </summary>
-    public static H264Encoder Create(H264EncoderConfig config, EncoderPreference preference)
-    {
-        if (preference != EncoderPreference.Software)
-        {
-            List<(IMFActivate Activate, string Name)> candidates = EnumerateHardware();
-            foreach ((IMFActivate activate, string name) in candidates)
-            {
-                H264Encoder? encoder = TryCreateHardware(activate, name, config);
-                if (encoder is not null)
-                {
-                    return encoder;
-                }
-            }
-
-            if (preference == EncoderPreference.Hardware)
-            {
-                throw new InvalidOperationException(candidates.Count == 0
-                    ? "No hardware H.264 encoder is installed on this machine."
-                    : "None of the hardware H.264 encoders on this machine could be used with these settings.");
-            }
-
-            if (Interlocked.Exchange(ref s_reportedSoftwareFallback, 1) == 0)
-            {
-                Log.Info(candidates.Count == 0
-                    ? "No hardware H.264 encoder found; using the software encoder."
-                    : "No usable hardware H.264 encoder; falling back to the software encoder.");
-            }
-        }
-
-        return CreateSoftware(config);
-    }
-
-    public static H264Encoder CreateSoftware(H264EncoderConfig config)
-    {
-        var transform = (IMFTransform)new MSH264EncoderMFT();
-        return new H264Encoder(transform, null, "Microsoft H264 Encoder MFT", isHardware: false, config);
-    }
-
-    /// <summary>Friendly names of the hardware H.264 encoder MFTs registered on this machine.</summary>
-    public static IReadOnlyList<string> ListHardwareEncoders()
-    {
-        List<(IMFActivate Activate, string Name)> candidates = EnumerateHardware();
-        foreach ((IMFActivate activate, _) in candidates)
-        {
-            Mf.Release(activate);
-        }
-
-        return candidates.ConvertAll(c => c.Name);
-    }
-
     /// <summary>Asks for the next encoded frame to be a key frame (IDR).</summary>
     public void RequestKeyFrame() => _keyFrameRequested = true;
 
@@ -236,10 +182,10 @@ internal sealed unsafe class H264Encoder : IDisposable
         }
     }
 
-    public void Dispose() => Dispose(drain: true);
+    public void Dispose() => Close(drain: true);
 
     /// <param name="drain">Whether to let the encoder finish and deliver frames it is still holding.</param>
-    public void Dispose(bool drain)
+    public void Close(bool drain)
     {
         if (_disposed)
         {
@@ -344,60 +290,6 @@ internal sealed unsafe class H264Encoder : IDisposable
         {
             FrameEncoded -= OnFrame;
         }
-    }
-
-    private static H264Encoder? TryCreateHardware(IMFActivate activate, string name, H264EncoderConfig config)
-    {
-        try
-        {
-            // The self-test runs on a throwaway instance so the live stream starts from a clean encoder.
-            using (var probe = new H264Encoder(Activate(activate), activate, name, isHardware: true, config))
-            {
-                probe.SelfTest();
-                probe.Dispose(drain: false);
-            }
-
-            return new H264Encoder(Activate(activate), activate, name, isHardware: true, config);
-        }
-        catch (Exception ex)
-        {
-            Log.Warn($"Hardware encoder '{name}' cannot be used: {ex.Message}");
-            activate.ShutdownObject();
-            return null;
-        }
-    }
-
-    private static IMFTransform Activate(IMFActivate activate)
-    {
-        Mf.Check(activate.ActivateObject(typeof(IMFTransform).GUID, out object transform), "Activate encoder MFT");
-        return (IMFTransform)transform;
-    }
-
-    private static List<(IMFActivate Activate, string Name)> EnumerateHardware()
-    {
-        var result = new List<(IMFActivate, string)>();
-        var outputType = new MFTRegisterTypeInfo { guidMajorType = MFMediaType.Video, guidSubtype = MFMediaType.H264 };
-
-        HResult hr = MFExtern.MFTEnumEx(
-            MFTransformCategory.MFT_CATEGORY_VIDEO_ENCODER,
-            MFT_EnumFlag.Hardware | MFT_EnumFlag.SortAndFilter,
-            null,
-            outputType,
-            out IMFActivate[] activates,
-            out int count);
-
-        if (Mf.Failed(hr) || activates is null)
-        {
-            return result;
-        }
-
-        for (int i = 0; i < count; i++)
-        {
-            string name = Mf.GetString(activates[i], MFAttributesClsid.MFT_FRIENDLY_NAME_Attribute) ?? $"Hardware H.264 encoder {i}";
-            result.Add((activates[i], name));
-        }
-
-        return result;
     }
 
     private bool UnlockIfAsync()
@@ -509,42 +401,14 @@ internal sealed unsafe class H264Encoder : IDisposable
 
         try
         {
-            byte[]? header = Mf.GetBlob(type, MFAttributesClsid.MF_MT_MPEG_SEQUENCE_HEADER);
-            if (header is not null)
+            if (Mf.GetBlob(type, MFAttributesClsid.MF_MT_MPEG_SEQUENCE_HEADER) is { } header)
             {
-                AnnexB.AccessUnitInfo info = AnnexB.Inspect(header);
-                UpdateParameterSets(info.Sps, info.Pps);
+                _parameterSets.Remember(header);
             }
         }
         finally
         {
             Mf.Release(type);
-        }
-    }
-
-    private void UpdateParameterSets(byte[]? sps, byte[]? pps)
-    {
-        if (sps is null && pps is null)
-        {
-            return;
-        }
-
-        bool changed = false;
-        if (sps is not null && (_sps is null || !sps.AsSpan().SequenceEqual(_sps)))
-        {
-            _sps = sps;
-            changed = true;
-        }
-
-        if (pps is not null && (_pps is null || !pps.AsSpan().SequenceEqual(_pps)))
-        {
-            _pps = pps;
-            changed = true;
-        }
-
-        if (changed && _sps is not null && _pps is not null)
-        {
-            _sequenceHeader = AnnexB.BuildSequenceHeader(_sps, _pps);
         }
     }
 
@@ -746,11 +610,8 @@ internal sealed unsafe class H264Encoder : IDisposable
             return null;
         }
 
-        var buffers = new MFTOutputDataBuffer[1];
         IMFSample? ownSample = null;
-        IntPtr ownPointer = IntPtr.Zero;
-        IMFSample? transformSample = null;
-
+        IMFSample? provided = null;
         try
         {
             if (!_transformAllocatesOutput)
@@ -758,13 +619,9 @@ internal sealed unsafe class H264Encoder : IDisposable
                 // A fresh sample every time (so no attributes leak from one frame to the next) around one reused buffer.
                 Mf.Check(_outputBuffer!.SetCurrentLength(0), "Reset encoder output buffer");
                 ownSample = Mf.CreateSample(_outputBuffer);
-                ownPointer = Marshal.GetComInterfaceForObject(ownSample, typeof(IMFSample));
-                buffers[0].pSample = ownPointer;
             }
 
-            HResult hr = _transform.ProcessOutput(MFTProcessOutputFlags.None, 1, buffers, out _);
-            Mf.Release(buffers[0].pEvents);
-
+            HResult hr = Mf.ProcessOutput(_transform, ownSample, out provided);
             if (hr == HResult.MF_E_TRANSFORM_NEED_MORE_INPUT)
             {
                 needMoreInput = true;
@@ -778,40 +635,13 @@ internal sealed unsafe class H264Encoder : IDisposable
             }
 
             Mf.Check(hr, "Encoder ProcessOutput");
-
-            if (!_transformAllocatesOutput)
-            {
-                return ReadFrame(ownSample!);
-            }
-
-            if (buffers[0].pSample == IntPtr.Zero)
-            {
-                return null;
-            }
-
-            transformSample = (IMFSample)Marshal.GetObjectForIUnknown(buffers[0].pSample);
-            return ReadFrame(transformSample);
+            IMFSample? output = ownSample ?? provided; // a transform that provides samples may have had none
+            return output is null ? null : ReadFrame(output);
         }
         finally
         {
-            if (_transformAllocatesOutput)
-            {
-                if (buffers[0].pSample != IntPtr.Zero)
-                {
-                    Marshal.Release(buffers[0].pSample);
-                }
-
-                Mf.Release(transformSample);
-            }
-            else
-            {
-                if (ownPointer != IntPtr.Zero)
-                {
-                    Marshal.Release(ownPointer);
-                }
-
-                Mf.Release(ownSample);
-            }
+            Mf.Release(ownSample);
+            Mf.Release(provided);
         }
     }
 
@@ -852,41 +682,20 @@ internal sealed unsafe class H264Encoder : IDisposable
             Mf.Check(buffer.Lock(out IntPtr pointer, out _, out int length), "IMFMediaBuffer.Lock");
             try
             {
-                var data = new ReadOnlySpan<byte>((void*)pointer, length);
-                AnnexB.AccessUnitInfo info = AnnexB.Inspect(data);
-                UpdateParameterSets(info.Sps, info.Pps);
-
-                if (!info.HasSlice)
+                // Parameter sets on their own are remembered, and there is nothing to show yet.
+                if (_parameterSets.Complete(new ReadOnlySpan<byte>((void*)pointer, length)) is not { } unit)
                 {
-                    // Parameter sets on their own: remembered above, nothing to show yet.
                     return null;
                 }
 
                 _lastTimestamp = timestamp;
-
-                // Receivers that join mid-stream and every file segment need SPS/PPS with the key
-                // frame; add them when the encoder only sent them once at the start.
-                byte[] bytes;
-                if (info.HasIdr && (info.Sps is null || info.Pps is null) && _sequenceHeader is not null)
-                {
-                    int at = info.ParameterSetOffset;
-                    bytes = new byte[_sequenceHeader.Length + length];
-                    data[..at].CopyTo(bytes);
-                    _sequenceHeader.CopyTo(bytes, at);
-                    data[at..].CopyTo(bytes.AsSpan(at + _sequenceHeader.Length));
-                }
-                else
-                {
-                    bytes = data.ToArray();
-                }
-
                 return new EncodedVideoFrame
                 {
-                    Data = bytes,
+                    Data = unit.Data,
                     Timestamp = timestamp,
                     Duration = duration,
-                    IsKeyFrame = info.HasIdr,
-                    SequenceHeader = info.HasIdr ? _sequenceHeader : null,
+                    IsKeyFrame = unit.IsKeyFrame,
+                    SequenceHeader = unit.IsKeyFrame ? _parameterSets.SequenceHeader : null,
                 };
             }
             finally
@@ -959,6 +768,11 @@ internal sealed unsafe class H264Encoder : IDisposable
 
         // For an activated (hardware) MFT this also lets the activation object create a fresh instance later.
         _activate?.ShutdownObject();
+        if (_ownsActivate)
+        {
+            Mf.Release(_activate);
+        }
+
         _drainComplete.Dispose();
     }
 }

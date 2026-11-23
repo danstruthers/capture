@@ -13,6 +13,9 @@
   --warn: #f0b429;
   --bad: #ff6b6b;
   --stage: #000;
+  /* Text on the stage, which is black in both themes. */
+  --stage-text: #e7eaee;
+  --stage-text-muted: #98a2b0;
 
   --radius: 8px;
   --gap: 16px;
@@ -256,7 +259,7 @@ main {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--stage);
-  color: #98a2b0;
+  color: var(--stage-text-muted);
   text-align: center;
 }
 
@@ -267,7 +270,7 @@ main {
 .placeholder-title {
   font-size: 16px;
   font-weight: 600;
-  color: #e7eaee;
+  color: var(--stage-text);
 }
 
 .tile {
@@ -365,7 +368,7 @@ main {
   display: grid;
   place-content: center;
   margin: 0;
-  color: #98a2b0;
+  color: var(--stage-text-muted);
   pointer-events: none;
 }
 
@@ -501,6 +504,71 @@ body.popout .placeholder {
   color: var(--good);
 }
 
+.pill[data-state="paused"] {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+
+.detail {
+  min-height: 1.45em;
+  margin-top: 2px;
+  color: var(--text-muted);
+  font-family: var(--mono);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.buttons {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.buttons button {
+  padding: 5px 0;
+}
+
+.settings {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 8px 12px;
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+
+.settings label {
+  color: var(--text-muted);
+}
+
+.settings select,
+.settings input {
+  width: 100%;
+  min-width: 0;
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+}
+
+.settings select:disabled,
+.settings input:disabled {
+  opacity: 0.5;
+}
+
+.with-unit {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-muted);
+}
+
+/* Watch: the screens of this window ------------------------------------ */
+
 .screens {
   display: grid;
   gap: 6px;
@@ -604,69 +672,6 @@ body.popout .placeholder {
 }
 
 .devices li[data-present="false"] .device-name {
-  color: var(--text-muted);
-}
-
-.pill[data-state="paused"] {
-  border-color: var(--warn);
-  color: var(--warn);
-}
-
-.detail {
-  min-height: 1.45em;
-  margin-top: 2px;
-  color: var(--text-muted);
-  font-family: var(--mono);
-  font-size: 12px;
-  overflow-wrap: anywhere;
-}
-
-.buttons {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 6px;
-  margin-top: 6px;
-}
-
-.buttons button {
-  padding: 5px 0;
-}
-
-.settings {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
-  align-items: center;
-  gap: 8px 12px;
-  margin-top: 16px;
-  padding-top: 14px;
-  border-top: 1px solid var(--border);
-}
-
-.settings label {
-  color: var(--text-muted);
-}
-
-.settings select,
-.settings input {
-  width: 100%;
-  min-width: 0;
-  padding: 5px 8px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--bg);
-  color: var(--text);
-  font: inherit;
-}
-
-.settings select:disabled,
-.settings input:disabled {
-  opacity: 0.5;
-}
-
-.with-unit {
-  display: flex;
-  align-items: center;
-  gap: 8px;
   color: var(--text-muted);
 }
 

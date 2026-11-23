@@ -101,14 +101,19 @@ internal sealed class MicrophoneSource : IAudioSource
         _disposed = true;
         _stopping = true;
 
-        if (!_thread.Join(TimeSpan.FromSeconds(1)))
+        // Normally the read loop ends within one buffer (~50 ms). If the reader is blocked waiting
+        // for a device that stopped delivering, shutting the source down unblocks it.
+        bool stopped = _thread.Join(TimeSpan.FromSeconds(1));
+        _source.Shutdown();
+        stopped = stopped || _thread.Join(TimeSpan.FromSeconds(2));
+
+        if (!stopped)
         {
-            // The reader is blocked waiting for a device that stopped delivering; shutting the source down unblocks it.
-            _source.Shutdown();
-            _thread.Join(TimeSpan.FromSeconds(2));
+            // Still inside the reader: releasing what it is using could crash it. Leave them to the GC.
+            Log.Debug($"{Name}: the read thread did not stop; leaving its objects to be collected.");
+            return;
         }
 
-        _source.Shutdown();
         _resampler.Dispose();
         Mf.Release(_reader);
         Mf.Release(_source);

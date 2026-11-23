@@ -15,7 +15,11 @@ internal sealed record VideoSettings(
     int? MaxHeight,
     bool DrawCursor,
     CaptureMethod CaptureMethod,
-    int JpegQuality);
+    int JpegQuality)
+{
+    public const int MinFps = 1;
+    public const int MaxFps = 60;
+}
 
 /// <summary>Running totals for the video path; subtract two snapshots to get rates.</summary>
 internal readonly record struct VideoStats(
@@ -39,6 +43,20 @@ internal readonly record struct VideoStats(
 /// grab. An encoder that cannot keep up drops frames rather than queueing them, which keeps the
 /// output live. When neither encoder is wanted the screen is not captured at all.
 /// </para>
+/// <para>
+/// Threads and what they own:
+/// <list type="bullet">
+/// <item>The capture thread reads the screen and queues frames.</item>
+/// <item>The H.264 thread converts and encodes. It alone replaces the encoder (on a frame rate
+/// change or a hardware failure), so it alone writes <c>_encoder</c>, <c>_config</c> and
+/// <c>_encoderPreference</c>; other threads only read the current values.</item>
+/// <item>The JPEG thread encodes pictures.</item>
+/// <item>Callers (the capture session) set the demand and the frame rate from any thread;
+/// <c>_configLock</c> guards the frame rate change waiting for the H.264 thread.</item>
+/// </list>
+/// <see cref="FrameEncoded"/> is raised on whichever thread the encoder delivers on: the H.264
+/// thread, a hardware encoder's event thread, or the thread disposing an encoder that is drained.
+/// </para>
 /// </summary>
 internal sealed unsafe class VideoPipeline : IDisposable
 {
@@ -61,6 +79,11 @@ internal sealed unsafe class VideoPipeline : IDisposable
     private volatile H264Encoder _encoder;
     private volatile H264EncoderConfig _config;
     private H264EncoderConfig? _pendingConfig;
+
+    // Which kind of encoder to create when the frame rate changes. Starts as configured; becomes
+    // Software once this stream has had to use the software encoder (no usable hardware encoder, or
+    // one that failed while running), so that a change does not search for hardware encoders again.
+    private EncoderPreference _encoderPreference;
     private PendingFrame? _jpegPending;
     private long _frameInterval;
     private volatile int _frameRate;
@@ -99,8 +122,9 @@ internal sealed unsafe class VideoPipeline : IDisposable
             _converter = new VideoConverter(_capturer.Width, _capturer.Height, width, height, settings.Fps, MFMediaType.NV12, _config.Bt709);
             try
             {
-                _encoder = H264Encoder.Create(_config, settings.Encoder);
+                _encoder = H264Encoders.Create(_config, settings.Encoder);
                 _encoder.FrameEncoded += OnFrameEncoded;
+                _encoderPreference = _encoder.IsHardware ? settings.Encoder : EncoderPreference.Software;
             }
             catch
             {
@@ -215,7 +239,7 @@ internal sealed unsafe class VideoPipeline : IDisposable
         return new VideoStats(
             Interlocked.Read(ref _framesCaptured),
             Interlocked.Read(ref _framesEncoded),
-            Interlocked.Read(ref _framesDropped) + _encoder.DroppedInputs,
+            Interlocked.Read(ref _framesDropped) + (_disposed ? 0 : _encoder.DroppedInputs), // a retired encoder's count is already in
             Interlocked.Read(ref _keyFrames),
             Interlocked.Read(ref _bytesEncoded),
             Interlocked.Read(ref _jpegFrames),
@@ -253,8 +277,7 @@ internal sealed unsafe class VideoPipeline : IDisposable
 
         Mf.Release(Interlocked.Exchange(ref _jpegPending, null)?.Sample);
 
-        _encoder.Dispose();
-        _encoder.FrameEncoded -= OnFrameEncoded;
+        RetireEncoder(drain: true);
         _converter.Dispose();
         _capturer.Dispose();
         _h264Queue.Dispose();
@@ -402,27 +425,9 @@ internal sealed unsafe class VideoPipeline : IDisposable
         }
     }
 
-    private IMFSample CopyFrame(long timestamp, long duration)
-    {
-        int size = _capturer.SizeInBytes;
-        IMFMediaBuffer buffer = Mf.CreateBuffer(size);
-        try
-        {
-            Mf.Check(buffer.Lock(out IntPtr pointer, out _, out _), "IMFMediaBuffer.Lock");
-            Buffer.MemoryCopy((void*)_capturer.Pixels, (void*)pointer, size, size);
-            buffer.Unlock();
-            Mf.Check(buffer.SetCurrentLength(size), "IMFMediaBuffer.SetCurrentLength");
-
-            IMFSample sample = Mf.CreateSample(buffer);
-            sample.SetSampleTime(timestamp);
-            sample.SetSampleDuration(duration);
-            return sample;
-        }
-        finally
-        {
-            Mf.Release(buffer);
-        }
-    }
+    /// <summary>A sample holding a copy of the frame just captured: the capturer reuses its buffer for the next one.</summary>
+    private IMFSample CopyFrame(long timestamp, long duration) =>
+        Mf.CreateSample(new ReadOnlySpan<byte>((void*)_capturer.Pixels, _capturer.SizeInBytes), timestamp, duration);
 
     private void H264Loop()
     {
@@ -430,11 +435,12 @@ internal sealed unsafe class VideoPipeline : IDisposable
         {
             foreach ((IMFSample sample, long timestamp) in _h264Queue.GetConsumingEnumerable())
             {
-                long started = Stopwatch.GetTimestamp();
                 IMFSample converted;
+                long started;
                 try
                 {
-                    ApplyPendingConfig();
+                    ApplyPendingConfig(); // not timed: setting up an encoder is not converting
+                    started = Stopwatch.GetTimestamp();
                     converted = _converter.Convert(sample, timestamp, _config.FrameDuration);
                 }
                 finally
@@ -474,15 +480,39 @@ internal sealed unsafe class VideoPipeline : IDisposable
             return;
         }
 
+        RetireEncoder(drain: true);
+        H264Encoder replacement = H264Encoders.Create(pending, _encoderPreference);
+        if (!replacement.IsHardware)
+        {
+            _encoderPreference = EncoderPreference.Software;
+        }
+
+        _config = pending;
+        UseEncoder(replacement);
+        Log.Debug($"{Area.Name}: {pending.Fps} fps, {pending.BitrateBps / 1000} kbit/s, {replacement.Name}.");
+    }
+
+    /// <summary>
+    /// Shuts the current encoder down. With <paramref name="drain"/>, the frames it is still holding
+    /// come out first and reach the recorder and the viewers like any other: that is why it is
+    /// disposed while still subscribed, and unsubscribed only afterwards. (Unsubscribing first would
+    /// silently cut the end off every recording at each frame rate change and at shutdown.)
+    /// </summary>
+    private void RetireEncoder(bool drain)
+    {
         H264Encoder old = _encoder;
-        old.Dispose();
+        old.Close(drain);
         old.FrameEncoded -= OnFrameEncoded;
 
-        H264Encoder replacement = H264Encoder.Create(pending, _settings.Encoder);
-        replacement.FrameEncoded += OnFrameEncoded;
-        _config = pending;
-        _encoder = replacement;
-        Log.Debug($"{Area.Name}: {pending.Fps} fps, {pending.BitrateBps / 1000} kbit/s, {replacement.Name}.");
+        // Its count of dropped frames would otherwise disappear with it.
+        Interlocked.Add(ref _framesDropped, old.DroppedInputs);
+    }
+
+    /// <summary>Makes <paramref name="encoder"/> the current encoder; called after <see cref="RetireEncoder"/>.</summary>
+    private void UseEncoder(H264Encoder encoder)
+    {
+        encoder.FrameEncoded += OnFrameEncoded;
+        _encoder = encoder;
     }
 
     /// <summary>
@@ -499,13 +529,10 @@ internal sealed unsafe class VideoPipeline : IDisposable
         {
             Log.Warn($"{Area.Name}: hardware encoder '{_encoder.Name}' failed ({ex.Message}); switching to the software encoder.");
 
-            H264Encoder failed = _encoder;
-            failed.FrameEncoded -= OnFrameEncoded;
-            failed.Dispose(drain: false);
-
-            H264Encoder replacement = H264Encoder.CreateSoftware(_config);
-            replacement.FrameEncoded += OnFrameEncoded;
-            _encoder = replacement;
+            // A failed encoder has nothing worth draining.
+            RetireEncoder(drain: false);
+            _encoderPreference = EncoderPreference.Software;
+            UseEncoder(H264Encoders.CreateSoftware(_config));
         }
     }
 

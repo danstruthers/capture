@@ -51,13 +51,16 @@ $script:commandId = 0
 $script:pages = @{}       # name -> DevTools socket of that page
 $script:current = $null   # the socket Get-Js talks to
 
-function Wait-Port([int]$port, [int]$timeoutSeconds = 20) {
+# Waits for a process to listen on a port. Generous: on a busy machine the capture client can take
+# a good while to start. Gives up at once if the process has exited.
+function Wait-Port([int]$port, [System.Diagnostics.Process]$process, [int]$timeoutSeconds = 60) {
     $deadline = (Get-Date).AddSeconds($timeoutSeconds)
     while ((Get-Date) -lt $deadline) {
+        if ($process -and $process.HasExited) { throw "$($process.ProcessName) exited with code $($process.ExitCode) before listening on port $port." }
         $client = [System.Net.Sockets.TcpClient]::new()
         try { $client.Connect('127.0.0.1', $port); return } catch { Start-Sleep -Milliseconds 200 } finally { $client.Dispose() }
     }
-    throw "Nothing started listening on port $port."
+    throw "Nothing started listening on port $port within $timeoutSeconds s."
 }
 
 # Attaches to the page whose address matches, under a name; it becomes the current page.
@@ -65,8 +68,13 @@ function Connect-Page([string]$name, [string]$urlPattern, [int]$timeoutSeconds =
     $deadline = (Get-Date).AddSeconds($timeoutSeconds)
     $page = $null
     while (-not $page -and (Get-Date) -lt $deadline) {
-        $page = @(Invoke-RestMethod "http://127.0.0.1:$DebugPort/json") | ForEach-Object { $_ } |
-            Where-Object { $_.type -eq 'page' -and $_.url -like $urlPattern } | Select-Object -First 1
+        try {
+            $page = @(Invoke-RestMethod "http://127.0.0.1:$DebugPort/json") | ForEach-Object { $_ } |
+                Where-Object { $_.type -eq 'page' -and $_.url -like $urlPattern } | Select-Object -First 1
+        }
+        catch {
+            # A busy Edge can drop a request to its DevTools endpoint; ask again.
+        }
         if (-not $page) { Start-Sleep -Milliseconds 200 }
     }
     if (-not $page) { return $false }
@@ -90,15 +98,25 @@ function Invoke-DevTools([string]$method, [hashtable]$parameters = @{}) {
     $bytes = [Text.Encoding]::UTF8.GetBytes($json)
     $script:current.SendAsync([ArraySegment[byte]]::new($bytes), 'Text', $true, [Threading.CancellationToken]::None).Wait()
 
+    # Edge answers in milliseconds; a minute without an answer means it has hung, and the run would too.
     $buffer = [byte[]]::new(1MB)
-    while ($true) {
-        $stream = [IO.MemoryStream]::new()
-        do {
-            $result = $script:current.ReceiveAsync([ArraySegment[byte]]::new($buffer), [Threading.CancellationToken]::None).Result
-            $stream.Write($buffer, 0, $result.Count)
-        } while (-not $result.EndOfMessage)
-        $message = [Text.Encoding]::UTF8.GetString($stream.ToArray()) | ConvertFrom-Json -Depth 32
-        if ($message.id -eq $id) { return $message.result }
+    $timeout = [Threading.CancellationTokenSource]::new([TimeSpan]::FromMinutes(1))
+    try {
+        while ($true) {
+            $stream = [IO.MemoryStream]::new()
+            do {
+                $result = $script:current.ReceiveAsync([ArraySegment[byte]]::new($buffer), $timeout.Token).GetAwaiter().GetResult()
+                $stream.Write($buffer, 0, $result.Count)
+            } while (-not $result.EndOfMessage)
+            $message = [Text.Encoding]::UTF8.GetString($stream.ToArray()) | ConvertFrom-Json -Depth 32
+            if ($message.id -eq $id) { return $message.result }
+        }
+    }
+    catch [OperationCanceledException] {
+        throw "Edge did not answer $method within a minute."
+    }
+    finally {
+        $timeout.Dispose()
     }
 }
 
@@ -119,15 +137,25 @@ function Write-Result([bool]$passed, [string]$what, [string]$detail = '') {
     }
 }
 
-# Passes as soon as the JavaScript condition is true; fails if it is not within the timeout.
+# Passes as soon as the JavaScript condition is true; fails if it is not within the timeout. An
+# exception (say, a stream that has not appeared yet) counts as not true yet; the last one is reported.
 function Assert-Eventually([string]$what, [string]$condition, [int]$timeoutSeconds = 15) {
     $deadline = (Get-Date).AddSeconds($timeoutSeconds)
+    $lastError = $null
     do {
-        if ((Get-Js "Boolean($condition)") -eq $true) { Write-Result $true $what; return }
+        try {
+            if ((Get-Js "Boolean($condition)") -eq $true) { Write-Result $true $what; return }
+        }
+        catch {
+            if ($_.Exception.Message -notlike 'JavaScript failed*') { throw }
+            $lastError = $_.Exception.Message
+        }
         Start-Sleep -Milliseconds 250
     } while ((Get-Date) -lt $deadline)
-    Write-Result $false $what "still false after $timeoutSeconds s: $condition"
+    Write-Result $false $what "still false after $timeoutSeconds s: $condition$(if ($lastError) { " ($lastError)" })"
 }
+
+function Write-Skipped([string]$what) { Write-Host "  (skipped: $what)" }
 
 function Assert-That([string]$what, [bool]$condition, [string]$detail = '') { Write-Result $condition $what $detail }
 
@@ -145,21 +173,25 @@ function Switch-AudioDevice([string]$id) {
 $processes = @()
 try {
     Write-Host "Starting the capture client, the viewer host and Edge (output in $work)"
+    # An empty configuration file, so that a local capture.json cannot change what is tested.
+    # The duration is a safety net: capture.exe ends by itself if this script dies without stopping it.
+    $config = Join-Path $work 'capture.json'
+    Set-Content -Path $config -Value '{}'
     $capture = Start-Process -FilePath $captureExe -WorkingDirectory $work -PassThru -WindowStyle Hidden `
-        -ArgumentList @('--port', $CapturePort, '--layout', 'separate', '--no-record', '--output-dir', '.', '--stats', '0', '--duration', '400') `
+        -ArgumentList @('--config', $config, '--port', $CapturePort, '--layout', 'separate', '--no-record', '--output-dir', '.', '--stats', '0', '--duration', '600') `
         -RedirectStandardOutput $captureLog -RedirectStandardError (Join-Path $work 'capture.err')
     $viewer = Start-Process -FilePath $viewerExe -WorkingDirectory (Join-Path $root 'src\Capture.Viewer') -PassThru -WindowStyle Hidden `
         -ArgumentList @('--urls', "http://localhost:$ViewerPort") -RedirectStandardOutput (Join-Path $work 'viewer.log')
     $processes += $capture, $viewer
-    Wait-Port $CapturePort
-    Wait-Port $ViewerPort
+    Wait-Port $CapturePort $capture
+    Wait-Port $ViewerPort $viewer
 
     $pageUrl = "http://localhost:$ViewerPort/?autoconnect&url=ws://localhost:$CapturePort/"
     $edge = Start-Process -FilePath $edgeExe -PassThru -ArgumentList @(
         '--headless=new', "--remote-debugging-port=$DebugPort", "--user-data-dir=`"$(Join-Path $work 'edge-profile')`"",
         '--autoplay-policy=no-user-gesture-required', '--no-first-run', '--window-size=1500,1000', $pageUrl)
     $processes += $edge
-    Wait-Port $DebugPort
+    Wait-Port $DebugPort $null
     if (-not (Connect-Page 'main' "http://localhost:$ViewerPort/?autoconnect*")) { throw 'The viewer page did not open in Edge.' }
 
     $stats = 'captureViewer.stats'
@@ -168,7 +200,9 @@ try {
     Write-Host 'H.264 over WebRTC, one stream per screen'
     Assert-Eventually 'the page receives the capture state' "$state !== null && $state.sources.length > 0"
     $sources = @(Get-Js "$state.sources.map(s => s.id)")
-    Assert-That 'there is one stream per screen' ((Get-Js "$state.layout") -eq 'separate' -and $sources.Count -ge 1) "layout $(Get-Js "$state.layout"), streams $($sources -join ', ')"
+    Add-Type -AssemblyName System.Windows.Forms
+    $screenCount = [System.Windows.Forms.Screen]::AllScreens.Count
+    Assert-That 'there is one stream per screen' ((Get-Js "$state.layout") -eq 'separate' -and $sources.Count -eq $screenCount) "layout $(Get-Js "$state.layout"), $screenCount screens, streams $($sources -join ', ')"
     Assert-Eventually 'every screen has a tile' "${stats}?.tiles?.length === $($sources.Count)"
     foreach ($id in $sources) {
         Assert-Eventually "$id is playing" "${stats}?.sources?.['$id']?.framesDecoded > 20" 30
@@ -178,6 +212,9 @@ try {
     if ($hasAudio) {
         Assert-Eventually 'audio packets arrive' "${stats}?.audio?.packetsReceived > 50"
         Assert-That 'the audio codec is G.711' ((Get-Js "$stats.audio.codec") -like 'G.711*')
+    }
+    else {
+        Write-Skipped 'the audio checks: the capture client has no audio'
     }
 
     $first = $sources[0]
@@ -190,6 +227,9 @@ try {
         Assert-That "$first keeps playing" ((Get-Js "$state.sources.find(s => s.id === '$first').viewers") -eq 1)
         Invoke-Click "#screens input[data-source='$second']"
         Assert-Eventually "$second is shown and playing again" "$stats.tiles.includes('$second') && $stats.sources['$second']?.framesPerSecond > 5" 15
+    }
+    else {
+        Write-Skipped 'choosing screens needs two screens'
     }
 
     Write-Host 'Zoom'
@@ -207,7 +247,7 @@ try {
     Assert-Eventually "$first leaves the main window" "$stats.popouts.includes('$first') && !$stats.tiles.includes('$first')" 5
     if (Connect-Page 'popout' "*popout=$first*") {
         Assert-Eventually "the pop-out window plays $first" "${stats}?.sources?.['$first']?.framesDecoded > 20 && $stats.tiles.length === 1" 30
-        Assert-That 'the pop-out window has no sound of its own' ((Get-Js "$stats.audio") -eq $null)
+        Assert-That 'the pop-out window has no sound of its own' ($null -eq (Get-Js "$stats.audio"))
         Use-Page 'main'
         Assert-Eventually 'the capture client sends the pop-out its screen' "$state.streaming.clients === 2 && $state.sources.find(s => s.id === '$first').viewers === 1"
         Use-Page 'popout'
@@ -234,7 +274,7 @@ try {
     Assert-Eventually 'recording resumes' "$state.recording.state === 'recording' && $state.recording.seconds > $($pausedAt + 1)"
     Invoke-Click '#recording-stop'
     Assert-Eventually 'recording stops' "$state.recording.state === 'stopped'"
-    $deadline = (Get-Date).AddSeconds(10)
+    $deadline = (Get-Date).AddSeconds(30) # finalizing takes a second or two, far longer on a busy machine
     # Case-sensitive: "Recordings are saved in ..." at startup must not count.
     while ((Get-Date) -lt $deadline -and @(Select-String -Path $captureLog -CaseSensitive -Pattern 'Saved .*\.mp4').Count -lt $sources.Count) { Start-Sleep -Milliseconds 250 }
     $recordings = @(Get-ChildItem $work -Filter *.mp4)
@@ -243,9 +283,15 @@ try {
     Write-Host 'Frame rate'
     Set-Field 'frame-rate' '10'
     Assert-Eventually 'the capture client reports 10 fps' "$state.video.frameRate === 10"
-    Start-Sleep -Seconds 5
-    $fps = [double](Get-Js "$stats.video.framesPerSecond")
-    Assert-That 'the page receives about 10 fps' ($fps -ge 8 -and $fps -le 12) "measured $fps fps"
+    # Each stream gets a new encoder for the new rate; once they are running the rate settles at about 10.
+    Assert-Eventually 'the page receives about 10 fps' "${stats}?.video?.framesPerSecond >= 8 && $stats.video.framesPerSecond <= 12" 30
+
+    Write-Host 'Refused requests'
+    Set-Field 'layout' 'grid' # no such option: the select sends '', which the capture client refuses
+    Assert-Eventually 'the refusal is shown under Remote control' "document.getElementById('control-note').dataset.kind === 'error' && document.getElementById('control-note').textContent.includes('layout')"
+    Assert-That 'and not under Audio devices' ((Get-Js "document.getElementById('audio-note').dataset.kind") -ne 'error')
+    Set-Field 'layout' 'separate'
+    Assert-Eventually 'the next request clears it' "document.getElementById('control-note').dataset.kind !== 'error'"
 
     Write-Host 'JPEG pictures over the WebSocket'
     Set-Field 'video-mode' 'jpeg'
@@ -274,7 +320,7 @@ try {
             Assert-Eventually 'the default recording device is recorded again' "$state.audio.source === 'microphone' && ['capturing', 'starting'].includes($state.audio.devices[0].status)"
         }
         else {
-            Write-Host "  (skipped: needs a playback device and the default audio source; selected: $selectedAtStart)"
+            Write-Skipped "ticking devices needs a playback device and the default audio source; selected: $selectedAtStart"
         }
     }
 
@@ -319,6 +365,10 @@ try {
 
     foreach ($socket in $script:pages.Values) { $socket.Dispose() }
 }
+catch {
+    # Startup failures and JavaScript exceptions end the run; they count, and get the logs shown below.
+    Write-Result $false 'the run completed' $_.Exception.Message
+}
 finally {
     foreach ($process in $processes) {
         if ($process -and -not $process.HasExited) { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue }
@@ -327,12 +377,16 @@ finally {
     Get-CimInstance Win32_Process -Filter "Name = 'msedge.exe'" | Where-Object { $_.CommandLine -like "*$work*" } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 
-    if ($script:failures -gt 0 -and (Test-Path $captureLog)) {
-        Write-Host '--- capture client log ---'
-        Get-Content $captureLog | Select-Object -Last 40 | Write-Host
+    if ($script:failures -gt 0) {
+        foreach ($log in @($captureLog, (Join-Path $work 'capture.err'), (Join-Path $work 'viewer.log'))) {
+            if ((Test-Path $log) -and (Get-Item $log).Length -gt 0) {
+                Write-Host "--- $(Split-Path -Leaf $log) ---"
+                Get-Content $log | Select-Object -Last 40 | Write-Host
+            }
+        }
     }
 
-    if ($KeepOutput) {
+    if ($KeepOutput -or $script:failures -gt 0) {
         Write-Host "Output kept in $work"
     }
     else {

@@ -85,29 +85,22 @@ internal sealed class ScreenCapturer : IDisposable
         {
             foreach (Output output in _outputs)
             {
+                // A screen the capturer this one replaces still has (after a layout change) is left
+                // for the first capture, by which time that capturer has been disposed.
                 if (DesktopDuplication.IsHeld(output.Display))
                 {
-                    // The capturer this one replaces (after a layout change) still has the screen. It
-                    // is disposed before this one starts capturing, so take the screen over then.
-                    output.HandoverPending = true;
                     continue;
                 }
 
-                output.Duplication = DesktopDuplication.TryCreate(output.Display, out string reason);
-                if (output.Duplication is not null)
+                try
                 {
-                    ReportHdr(output);
-                    continue;
+                    TryDuplicate(output, Stopwatch.GetTimestamp(), required: method == CaptureMethod.Dxgi);
                 }
-
-                if (method == CaptureMethod.Dxgi)
+                catch
                 {
                     Dispose();
-                    throw new InvalidOperationException($"Desktop duplication is not available for screen {output.Display.Number}: {reason}.");
+                    throw;
                 }
-
-                Log.Info($"Desktop duplication is not available for screen {output.Display.Number} ({reason}); capturing it with GDI instead.");
-                output.NextAttempt = Stopwatch.GetTimestamp() + RetryInterval;
             }
         }
     }
@@ -127,7 +120,7 @@ internal sealed class ScreenCapturer : IDisposable
     {
         get
         {
-            int duplicated = _outputs.Count(output => output.Duplication is not null || output.HandoverPending);
+            int duplicated = _outputs.Count(output => output.Duplication is not null || (_useDuplication && !output.Tried));
             return duplicated == _outputs.Length ? "DXGI desktop duplication"
                 : duplicated == 0 ? "GDI"
                 : "DXGI desktop duplication and GDI";
@@ -135,9 +128,10 @@ internal sealed class ScreenCapturer : IDisposable
     }
 
     /// <summary>
-    /// Captures the area into <see cref="Pixels"/>. Returns false, leaving the previous picture in
-    /// place where it could not be read, when the desktop cannot be read at all (lock screen, UAC
-    /// prompt, session switch).
+    /// Captures the area into <see cref="Pixels"/>. Returns false when a screen that had to be
+    /// copied with GDI could not be (the lock screen, a UAC prompt, a session switch): that
+    /// screen's previous picture stays in place, and <paramref name="errorCode"/> says why. The
+    /// other screens of the area are captured either way.
     /// </summary>
     public bool Capture(out int errorCode)
     {
@@ -246,38 +240,13 @@ internal sealed class ScreenCapturer : IDisposable
             return false;
         }
 
-        if (output.Duplication is null)
+        // Duplication is lost whenever the desktop changes under it; keep trying to get it back.
+        if (output.Duplication is null && (now < output.NextAttempt || !TryDuplicate(output, now, required: false)))
         {
-            // Duplication is lost whenever the desktop changes under it; keep trying to get it back.
-            if (now < output.NextAttempt)
-            {
-                return false;
-            }
-
-            output.Duplication = DesktopDuplication.TryCreate(output.Display, out string reason);
-            bool handover = output.HandoverPending;
-            output.HandoverPending = false;
-
-            if (output.Duplication is null)
-            {
-                if (handover)
-                {
-                    Log.Info($"Desktop duplication is not available for screen {output.Display.Number} ({reason}); capturing it with GDI instead.");
-                }
-
-                output.NextAttempt = now + RetryInterval;
-                return false;
-            }
-
-            if (!handover)
-            {
-                Log.Info($"Desktop duplication of screen {output.Display.Number} is available again.");
-            }
-
-            ReportHdr(output);
+            return false;
         }
 
-        switch (output.Duplication.Update())
+        switch (output.Duplication!.Update())
         {
             case DuplicationStatus.Ready:
                 return true;
@@ -289,11 +258,54 @@ internal sealed class ScreenCapturer : IDisposable
         }
     }
 
+    /// <summary>
+    /// The one way a screen gets desktop duplication: when the capturer is made, when taking a
+    /// screen over from the capturer this one replaces, and when trying again after it was lost.
+    /// Says what happened when that matters: whether it works, the first time the screen is tried;
+    /// later, that it works again.
+    /// </summary>
+    /// <param name="required">
+    /// --capture dxgi, when the capturer is made: duplication has to work, or this throws. If it is
+    /// lost later (the lock screen, a display mode change), GDI covers until it is back, whatever
+    /// the setting.
+    /// </param>
+    private bool TryDuplicate(Output output, long now, bool required)
+    {
+        bool first = !output.Tried;
+        output.Tried = true;
+        int number = output.Display.Number;
+
+        output.Duplication = DesktopDuplication.TryCreate(output.Display, out string reason);
+        if (output.Duplication is null)
+        {
+            if (required)
+            {
+                throw new InvalidOperationException($"Desktop duplication is not available for screen {number}: {reason}.");
+            }
+
+            if (first)
+            {
+                Log.Info($"Desktop duplication is not available for screen {number} ({reason}); capturing it with GDI instead.");
+            }
+
+            output.NextAttempt = now + RetryInterval;
+            return false;
+        }
+
+        if (!first)
+        {
+            Log.Info($"Desktop duplication of screen {number} is available again.");
+        }
+
+        ReportHdr(output);
+        return true;
+    }
+
     /// <summary>Says when a screen's HDR mode starts or stops mattering to its capture (HDR is switched in Windows' display settings).</summary>
     private static void ReportHdr(Output output)
     {
         DesktopDuplication duplication = output.Duplication!;
-        bool hdr = duplication.IsHdr || duplication.HdrProblem is not null;
+        bool hdr = duplication.ConvertsHdr || duplication.HdrProblem is not null;
         if (hdr == output.Hdr)
         {
             return;
@@ -301,7 +313,7 @@ internal sealed class ScreenCapturer : IDisposable
 
         output.Hdr = hdr;
         int number = output.Display.Number;
-        if (duplication.IsHdr)
+        if (duplication.ConvertsHdr)
         {
             Log.Info($"Screen {number} is in HDR mode; its picture is converted to SDR, with white at Windows' SDR content brightness ({duplication.SdrWhiteLevel:0} nits).");
         }
@@ -370,8 +382,11 @@ internal sealed class ScreenCapturer : IDisposable
 
         public DesktopDuplication? Duplication { get; set; }
 
-        /// <summary>Another capturer had the screen when this one was made; the first capture takes it over.</summary>
-        public bool HandoverPending { get; set; }
+        /// <summary>
+        /// Whether duplication has been tried for this screen. Not yet when another capturer had
+        /// the screen as this one was made: the first capture takes it over.
+        /// </summary>
+        public bool Tried { get; set; }
 
         /// <summary>Whether the screen was in HDR mode when last duplicated, to report changes.</summary>
         public bool Hdr { get; set; }

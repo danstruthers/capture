@@ -87,16 +87,9 @@ internal sealed class VideoConverter : IDisposable
         IMFSample output = Mf.CreateSample(buffer);
         Mf.Release(buffer);
 
-        IntPtr samplePointer = Marshal.GetComInterfaceForObject(output, typeof(IMFSample));
         try
         {
-            var buffers = new MFTOutputDataBuffer[1];
-            buffers[0].pSample = samplePointer;
-
-            HResult hr = _processor.ProcessOutput(MFTProcessOutputFlags.None, 1, buffers, out _);
-            Mf.Release(buffers[0].pEvents);
-            Mf.Check(hr, "Video processor ProcessOutput");
-
+            Mf.Check(Mf.ProcessOutput(_processor, output, out _), "Video processor ProcessOutput");
             output.SetSampleTime(timestamp);
             output.SetSampleDuration(duration);
             return output;
@@ -105,10 +98,6 @@ internal sealed class VideoConverter : IDisposable
         {
             Mf.Release(output);
             throw;
-        }
-        finally
-        {
-            Marshal.Release(samplePointer);
         }
     }
 

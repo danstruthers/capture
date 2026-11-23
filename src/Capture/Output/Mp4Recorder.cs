@@ -209,7 +209,7 @@ internal sealed class Mp4Recorder : IDisposable
                 case RecordingState.Paused:
                     return;
                 case RecordingState.Stopped:
-                    throw new InvalidOperationException("Recording is stopped, so there is nothing to pause.");
+                    throw new RefusedException("Recording is stopped, so there is nothing to pause.");
             }
 
             _state = RecordingState.Paused;
@@ -236,7 +236,7 @@ internal sealed class Mp4Recorder : IDisposable
                 case RecordingState.Recording:
                     return;
                 case RecordingState.Stopped:
-                    throw new InvalidOperationException("Recording is stopped. Start it instead of resuming.");
+                    throw new RefusedException("Recording is stopped. Start it instead of resuming.");
             }
 
             ResumeLocked();
@@ -504,11 +504,20 @@ internal sealed class Mp4Recorder : IDisposable
     private bool AnyFileExists(string recordingPath) =>
         _sources.Any(source => File.Exists(PathForFile(new Track(source, TrackPath(recordingPath, source)), 1)));
 
-    /// <summary>Picks the name of a new recording: the configured name the first time, then numbered or timestamped names.</summary>
+    /// <summary>
+    /// Picks the name of a new recording: the configured name the first time, then numbered or
+    /// timestamped names. A recording only counts once its name is settled, so that a refused start
+    /// (the name is taken) does not move later recordings on to the next number.
+    /// </summary>
     private string NextRecordingPath()
     {
+        string path = ChooseRecordingPath(_recordingCount + 1);
         _recordingCount++;
+        return path;
+    }
 
+    private string ChooseRecordingPath(int recordingNumber)
+    {
         if (_outputPath is null)
         {
             string stem = Path.Combine(_directory, $"capture-{DateTime.Now:yyyyMMdd-HHmmss}");
@@ -521,18 +530,18 @@ internal sealed class Mp4Recorder : IDisposable
             return path;
         }
 
-        if (_recordingCount == 1)
+        if (recordingNumber == 1)
         {
             if (!_overwrite && AnyFileExists(_outputPath))
             {
-                throw new InvalidOperationException($"A recording called {Path.GetFileName(_outputPath)} already exists in {Path.GetDirectoryName(_outputPath)}. Choose another --output name or pass --overwrite.");
+                throw new RefusedException($"A recording called {Path.GetFileName(_outputPath)} already exists in {Path.GetDirectoryName(_outputPath)}. Choose another --output name or pass --overwrite.");
             }
 
             return _outputPath;
         }
 
         string extension = Path.GetExtension(_outputPath);
-        for (int n = _recordingCount; ; n++)
+        for (int n = recordingNumber; ; n++)
         {
             string path = $"{Stem(_outputPath)}-{n}{extension}";
             if (_overwrite || !AnyFileExists(path))

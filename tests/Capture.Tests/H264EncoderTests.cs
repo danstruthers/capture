@@ -81,7 +81,7 @@ public class H264EncoderTests
     [Fact]
     public void Software_encoder_delivers_every_frame_in_order_starting_with_a_key_frame()
     {
-        H264Encoder encoder = H264Encoder.CreateSoftware(TestFrames.Config);
+        H264Encoder encoder = H264Encoders.CreateSoftware(TestFrames.Config);
         Assert.False(encoder.IsAsync);
         Assert.False(encoder.IsHardware);
 
@@ -94,7 +94,7 @@ public class H264EncoderTests
     [Fact]
     public void Software_encoder_makes_a_key_frame_on_request()
     {
-        H264Encoder encoder = H264Encoder.CreateSoftware(TestFrames.Config);
+        H264Encoder encoder = H264Encoders.CreateSoftware(TestFrames.Config);
 
         List<EncodedVideoFrame> frames = Encode(encoder, 20, beforeFrame: i =>
         {

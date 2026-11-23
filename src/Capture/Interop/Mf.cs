@@ -1,5 +1,6 @@
 using System.Runtime.InteropServices;
 using MediaFoundation;
+using MediaFoundation.Transform;
 
 namespace Capture.Interop;
 
@@ -134,6 +135,39 @@ internal static unsafe class Mf
         finally
         {
             Release(buffer);
+        }
+    }
+
+    /// <summary>
+    /// Asks a one-stream transform for one output sample, doing the reference counting that
+    /// IMFTransform::ProcessOutput needs. With <paramref name="into"/>, the transform fills that
+    /// sample, which stays the caller's. Without, the transform provides the sample, returned in
+    /// <paramref name="provided"/> for the caller to release. Returns the result as it is:
+    /// MF_E_TRANSFORM_NEED_MORE_INPUT and MF_E_TRANSFORM_STREAM_CHANGE are not errors for a caller.
+    /// </summary>
+    public static HResult ProcessOutput(IMFTransform transform, IMFSample? into, out IMFSample? provided)
+    {
+        var buffers = new MFTOutputDataBuffer[1];
+        buffers[0].pSample = into is null ? IntPtr.Zero : Marshal.GetComInterfaceForObject(into, typeof(IMFSample));
+        provided = null;
+        try
+        {
+            HResult hr = transform.ProcessOutput(MFTProcessOutputFlags.None, 1, buffers, out _);
+            Release(buffers[0].pEvents);
+            if (into is null && buffers[0].pSample != IntPtr.Zero)
+            {
+                provided = (IMFSample)Marshal.GetObjectForIUnknown(buffers[0].pSample);
+            }
+
+            return hr;
+        }
+        finally
+        {
+            // The pointer made for the call, or the reference the transform handed over (the wrapper keeps its own).
+            if (buffers[0].pSample != IntPtr.Zero)
+            {
+                Marshal.Release(buffers[0].pSample);
+            }
         }
     }
 
