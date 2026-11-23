@@ -135,16 +135,21 @@ internal static class Program
         }
 
         Console.WriteLine();
-        Console.WriteLine("Audio recording devices (--audio-device):");
+        Console.WriteLine("Audio devices (--audio-device):");
         IReadOnlyList<AudioDeviceInfo> audioDevices = AudioDevices.Enumerate();
-        if (audioDevices.Count == 0)
+        foreach ((AudioDeviceKind kind, string heading) in new[] { (AudioDeviceKind.Input, "Recording"), (AudioDeviceKind.Output, "Playback, recorded as what they play") })
         {
-            Console.WriteLine("  (none)");
-        }
+            Console.WriteLine($"  {heading}:");
+            AudioDeviceInfo[] devices = [.. audioDevices.Where(device => device.Kind == kind)];
+            if (devices.Length == 0)
+            {
+                Console.WriteLine("    (none)");
+            }
 
-        foreach (AudioDeviceInfo device in audioDevices)
-        {
-            Console.WriteLine($"  {device.Number}: {device.Name}");
+            foreach (AudioDeviceInfo device in devices)
+            {
+                Console.WriteLine($"    {device.Number}: {device.Name}{(device.IsDefault ? "  [default]" : string.Empty)}");
+            }
         }
 
         Console.WriteLine();

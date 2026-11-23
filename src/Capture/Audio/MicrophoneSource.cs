@@ -8,7 +8,14 @@ namespace Capture.Audio;
 /// <summary>Something that records audio and places it, converted to <see cref="PcmFormat"/>, on a timeline.</summary>
 internal interface IAudioSource : IDisposable
 {
+    /// <summary>The device's name.</summary>
     string Name { get; }
+
+    /// <summary>The format the device delivers, for display: "48000 Hz, 2 ch, 32-bit float".</summary>
+    string Format { get; }
+
+    /// <summary>How long after a moment its audio can be relied on to be on the timeline, in 100 ns units.</summary>
+    long Latency { get; }
 
     AudioTimeline Timeline { get; }
 
@@ -32,11 +39,12 @@ internal sealed class MicrophoneSource : IAudioSource
     private volatile bool _stopping;
     private bool _disposed;
 
-    public MicrophoneSource(string? deviceSelector, MediaClock clock)
+    public MicrophoneSource(AudioDeviceInfo device, MediaClock clock)
     {
         // Device timestamps are on the Media Foundation system clock; this moves them to the session clock.
         _systemTimeOffset = MFExtern.MFGetSystemTime() - clock.Now;
-        _source = AudioDevices.Open(deviceSelector, out string deviceName);
+        Name = device.Name;
+        _source = AudioDevices.OpenInput(device);
 
         try
         {
@@ -50,7 +58,7 @@ internal sealed class MicrophoneSource : IAudioSource
             IMFMediaType outputType = Mf.CreatePcmType(PcmFormat.SampleRate, PcmFormat.Channels);
             try
             {
-                Name = $"{deviceName} ({Describe(deviceType)})";
+                Format = Describe(deviceType);
                 _resampler = new AudioResampler(deviceType, outputType);
             }
             finally
@@ -73,6 +81,11 @@ internal sealed class MicrophoneSource : IAudioSource
     }
 
     public string Name { get; }
+
+    public string Format { get; }
+
+    /// <summary>A recording device delivers ~50 ms buffers shortly after they end.</summary>
+    public long Latency => 120 * 10_000;
 
     public AudioTimeline Timeline { get; } = new();
 

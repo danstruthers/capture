@@ -12,8 +12,13 @@
 //   viewer -> capture   {"type":"select","sources":["screen1",...],"audio":true}    what this window shows
 //                       {"type":"command","target":"recording"|"streaming","action":"start"|"stop"|"pause"|"resume"}
 //                       {"type":"configure","frameRate":15}  /  "videoMode":"h264"|"jpeg"  /
-//                         "audioSource":"microphone"|"desktop"|"both"|"none"  /  "layout":"separate"|"desktop"
+//                         "audioDevices":["default-input","<device id>",...]  /  "layout":"separate"|"desktop"
 //                       {"type":"answer","sdp":...}  and ICE candidates
+//
+// The state's audio.devices lists every audio device the capture client can record, recording
+// devices ("input") and playback devices ("output", recorded as what they play), each with its
+// id, whether it is selected and how it is doing. "default-input" and "default-output" stand for
+// Windows' default devices and follow them when they change.
 //
 // Media arrives in one of two ways, chosen by the capture client's video mode:
 //   h264  a WebRTC session offered by the capture client: one H.264 track per stream, G.711 audio
@@ -70,7 +75,11 @@ const el = {
   layout: byId('layout'),
   videoMode: byId('video-mode'),
   frameRate: byId('frame-rate'),
-  audioSource: byId('audio-source'),
+  audioDevices: byId('audio-devices'),
+  audioNote: byId('audio-note'),
+  audioGroups: byId('audio-groups'),
+  audioInputs: byId('audio-inputs'),
+  audioOutputs: byId('audio-outputs'),
   screens: byId('screens'),
   tileTemplate: byId('tile-template'),
   stats: {
@@ -103,6 +112,9 @@ const popouts = new Map();
 const statCells = {};
 
 let screenListKey = '';
+let audioListKey = '';
+
+const DEFAULT_DEVICE_IDS = ['default-input', 'default-output'];
 
 // ---------------------------------------------------------------------------------------------
 // Page chrome
@@ -809,6 +821,8 @@ function connect() {
     bytesReceived: 0,
     state: null,
     lastSelection: '',
+    audioPending: null,       // {ids, until}: an audio device change sent but not yet confirmed
+    audioError: null,         // why the last audio device change was refused
     // WebRTC (h264 mode)
     peer: null,
     signaling: Promise.resolve(),
@@ -901,7 +915,14 @@ async function handleMessage(s, data) {
       applyState(s, message);
     } else if (message.type === 'error') {
       log(message.message, 'error');
-      showControlNote(message.message, 'error');
+      if (s.audioPending) {
+        // The refusal of the audio change just asked for: the list goes back to what is recorded.
+        s.audioPending = null;
+        s.audioError = message.message;
+        renderAudioDevices(s.state);
+      } else {
+        showControlNote(message.message, 'error');
+      }
     } else if (message.sdp) {
       if (message.type === 'offer') {
         await acceptOffer(s, message);
@@ -1024,8 +1045,13 @@ function applyState(s, state) {
   if (previous && previous.video.frameRate !== state.video.frameRate) {
     log(`Frame rate is ${state.video.frameRate} fps`);
   }
-  if (previous && previous.audio.source !== state.audio.source) {
-    log(`Audio source is ${state.audio.source}`);
+  if (!previous || !sameMembers(previous.audio.selected, state.audio.selected)) {
+    if (state.audio.enabled) {
+      log(`Audio from: ${describeAudioSelection(state.audio)}`);
+    }
+  }
+  if (s.audioPending && (sameMembers(s.audioPending.ids, state.audio.selected) || performance.now() > s.audioPending.until)) {
+    s.audioPending = null;
   }
 
   if (!previous || previous.streaming.state !== streaming || previous.video.mode !== mode || previous.sources.map((source) => source.id).join(',') !== sourceIds) {
@@ -1102,13 +1128,11 @@ function showControls(state) {
   el.layout.disabled = !enabled;
   el.videoMode.disabled = !enabled;
   el.frameRate.disabled = !enabled;
-  el.audioSource.disabled = !enabled || !state.audio.enabled;
 
   if (state) {
     setValue(el.layout, state.layout);
     setValue(el.videoMode, state.video.mode);
     setValue(el.frameRate, state.video.frameRate);
-    setValue(el.audioSource, state.audio.enabled ? state.audio.source : 'none');
   }
 
   if (!state) {
@@ -1118,6 +1142,156 @@ function showControls(state) {
   } else if (el.controlNote.dataset.kind !== 'error') {
     showControlNote('');
   }
+
+  renderAudioDevices(state);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Audio devices: a tick box for each device the capture client can record
+// ---------------------------------------------------------------------------------------------
+
+function sameMembers(a = [], b = []) {
+  return a.length === b.length && a.every((item) => b.includes(item));
+}
+
+function isDefaultEntry(device) {
+  return DEFAULT_DEVICE_IDS.includes(device.id);
+}
+
+/** What is selected as far as this page knows: a change it asked for counts before the capture client confirms it. */
+function audioSelection(s) {
+  return s?.audioPending?.ids ?? s?.state?.audio?.selected ?? [];
+}
+
+/** "the default recording device (Microphone (USB Audio))", or the device's name. */
+function audioDeviceLabel(device) {
+  if (isDefaultEntry(device)) {
+    const kind = device.kind === 'input' ? 'recording' : 'playback';
+    return device.device ? `the default ${kind} device (${device.device})` : `the default ${kind} device`;
+  }
+  return device.name;
+}
+
+function describeAudioSelection(audio) {
+  const names = audio.selected.map((id) => {
+    const device = audio.devices.find((candidate) => candidate.id === id);
+    return device ? audioDeviceLabel(device) : id;
+  });
+  return names.length > 0 ? names.join(' + ') : 'nothing (silence)';
+}
+
+/** The line under a device's name: which device a default entry is, and how a selected device is doing. */
+function describeAudioDevice(device, selected) {
+  const parts = [];
+  if (isDefaultEntry(device)) {
+    parts.push(device.device ?? `there is no ${device.kind === 'input' ? 'recording' : 'playback'} device`);
+  } else {
+    if (device.default) {
+      parts.push('Windows default');
+    }
+    if (!device.present) {
+      parts.push('not connected');
+    }
+  }
+
+  if (device.status === 'capturing') {
+    parts.push(device.format ? `live · ${device.format}` : 'live');
+  } else if (selected && device.status === 'starting') {
+    parts.push('starting…');
+  } else if (selected && device.status === 'idle') {
+    parts.push('idle: nothing is recorded or watched');
+  } else if (selected && device.status === 'unavailable') {
+    parts.push(device.problem ?? 'unavailable');
+  }
+  return parts.join(' · ');
+}
+
+function audioDeviceItem(device, selected, canChange) {
+  const item = document.createElement('li');
+  item.dataset.status = selected || device.status === 'capturing' ? device.status : 'off';
+  item.dataset.present = String(device.present);
+
+  const label = document.createElement('label');
+  const box = document.createElement('input');
+  box.type = 'checkbox';
+  box.dataset.device = device.id;
+  box.checked = selected;
+  box.disabled = !canChange || (!selected && !device.present);
+  box.addEventListener('change', () => chooseAudioDevice(device, box.checked));
+
+  const name = document.createElement('span');
+  name.className = isDefaultEntry(device) ? 'device-name stand-in' : 'device-name';
+  name.textContent = isDefaultEntry(device) ? 'Default device' : device.name;
+  label.append(box, name);
+
+  const detail = document.createElement('span');
+  detail.className = 'device-detail';
+  detail.textContent = describeAudioDevice(device, selected);
+
+  item.append(label, detail);
+  return item;
+}
+
+/** The list under Audio devices: recording devices, then playback devices, each with the default first. */
+function renderAudioDevices(state) {
+  const s = session;
+  const audio = state?.audio;
+  const canChange = Boolean(state?.remoteControl && audio?.enabled);
+  const selected = new Set(audioSelection(s));
+  const devices = audio?.enabled ? audio.devices ?? [] : [];
+
+  let note = '';
+  let kind = 'info';
+  if (!state) {
+    note = 'Connect to see the audio devices.';
+  } else if (!audio.enabled) {
+    note = 'Audio is turned off on the capture client.';
+  } else if (s?.audioError) {
+    note = s.audioError;
+    kind = 'error';
+  } else if (!state.remoteControl) {
+    note = 'Remote control is turned off on the capture client, so these cannot be changed here.';
+  } else if (selected.size === 0) {
+    note = 'Nothing is ticked: the audio is silence.';
+  }
+  el.audioNote.textContent = note;
+  el.audioNote.dataset.kind = kind;
+  el.audioNote.hidden = note === '';
+  el.audioGroups.hidden = devices.length === 0;
+
+  const key = JSON.stringify([canChange, [...selected], devices]);
+  if (key === audioListKey) {
+    return;
+  }
+  audioListKey = key;
+
+  // The list is rebuilt; keep the keyboard focus on the device that had it.
+  const focused = el.audioDevices.contains(document.activeElement) ? document.activeElement.dataset.device : undefined;
+  el.audioInputs.replaceChildren(...devices.filter((device) => device.kind === 'input').map((device) => audioDeviceItem(device, selected.has(device.id), canChange)));
+  el.audioOutputs.replaceChildren(...devices.filter((device) => device.kind === 'output').map((device) => audioDeviceItem(device, selected.has(device.id), canChange)));
+  if (focused !== undefined) {
+    [...el.audioDevices.querySelectorAll('input')].find((box) => box.dataset.device === focused)?.focus();
+  }
+}
+
+/** Asks the capture client to record, or stop recording, one device; the others stay as they are. */
+function chooseAudioDevice(device, record) {
+  const s = session;
+  if (!s?.state) {
+    return;
+  }
+
+  const ids = audioSelection(s).filter((id) => id !== device.id);
+  if (record) {
+    ids.push(device.id);
+  }
+
+  // Until the capture client confirms, the page shows what was asked for, and a second click builds on it.
+  s.audioPending = { ids, until: performance.now() + 3000 };
+  s.audioError = null;
+  log(`Request: ${record ? 'record' : 'stop recording'} ${audioDeviceLabel(device)}`);
+  send({ type: 'configure', audioDevices: ids });
+  renderAudioDevices(s.state);
 }
 
 function sendCommand(target, action) {
@@ -1596,7 +1770,6 @@ for (const target of ['recording', 'streaming']) {
 
 el.layout.addEventListener('change', () => configure('layout', el.layout.value));
 el.videoMode.addEventListener('change', () => configure('videoMode', el.videoMode.value));
-el.audioSource.addEventListener('change', () => configure('audioSource', el.audioSource.value));
 el.frameRate.addEventListener('change', () => {
   const value = Number(el.frameRate.value);
   if (Number.isInteger(value) && value >= 1 && value <= 60) {

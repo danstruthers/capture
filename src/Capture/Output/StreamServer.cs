@@ -41,7 +41,7 @@ internal interface IRemoteControl
     /// <summary>Runs start/stop/pause/resume on "recording" or "streaming". Throws <see cref="InvalidOperationException"/> with a message for the user if it cannot.</summary>
     void Execute(string target, string action);
 
-    /// <summary>Applies settings such as frameRate, videoMode, audioSource and layout. Throws <see cref="InvalidOperationException"/> likewise.</summary>
+    /// <summary>Applies settings such as frameRate, videoMode, audioDevices and layout. Throws <see cref="InvalidOperationException"/> likewise.</summary>
     void Configure(JsonElement settings);
 }
 
@@ -58,7 +58,7 @@ internal sealed record StreamSource(string Id, int Number, Action RequestKeyFram
 /// client is doing and which video streams it offers, sent on connect and on every change),
 /// "error" (a refused request), and the WebRTC "offer" and ICE candidates. From the viewer:
 /// "select" (which streams this viewer wants), "command" (start/stop/pause/resume of recording or
-/// streaming), "configure" (frame rate, video mode, audio source, screen layout), and the WebRTC
+/// streaming), "configure" (frame rate, video mode, audio devices, screen layout), and the WebRTC
 /// "answer" and ICE candidates.
 /// </para>
 /// <para>

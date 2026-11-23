@@ -3,68 +3,170 @@ using MediaFoundation;
 
 namespace Capture.Audio;
 
-internal sealed record AudioDeviceInfo(int Index, string Name, string EndpointId)
+internal enum AudioDeviceKind
 {
-    /// <summary>The number shown to people: 1 for the first device.</summary>
-    public int Number => Index + 1;
+    /// <summary>A recording device: a microphone, line in, ...</summary>
+    Input,
+
+    /// <summary>A playback device, recorded as what it plays (loopback).</summary>
+    Output,
 }
 
-/// <summary>Audio capture (recording) endpoints as Media Foundation device sources.</summary>
+/// <summary>An audio device as Windows knows it.</summary>
+/// <param name="Id">The endpoint ID, which stays the same for as long as the device is installed.</param>
+internal sealed record AudioDeviceInfo(string Id, string Name, AudioDeviceKind Kind)
+{
+    /// <summary>Whether it is plugged in and enabled, so that it can be recorded.</summary>
+    public bool IsConnected { get; init; } = true;
+
+    /// <summary>Whether it is Windows' default device of its kind.</summary>
+    public bool IsDefault { get; init; }
+
+    /// <summary>Its number in <see cref="AudioDevices.Enumerate"/> (and --list-devices), from 1; 0 when it is not in that list.</summary>
+    public int Number { get; init; }
+}
+
+/// <summary>What the mixer needs from the audio devices. Tests put their own devices in its place.</summary>
+internal interface IAudioEndpoints
+{
+    /// <summary>The ID of Windows' default device of a kind, or null when there is none.</summary>
+    string? GetDefaultId(AudioDeviceKind kind);
+
+    /// <summary>The device with this ID, connected or not; null when Windows does not know it.</summary>
+    AudioDeviceInfo? Get(string id);
+
+    /// <summary>Starts recording from a connected device. Throws if that cannot be done.</summary>
+    IAudioSource Open(AudioDeviceInfo device, MediaClock clock);
+}
+
+/// <summary>
+/// The audio devices of this PC, through Core Audio: the same devices, names and IDs as Windows'
+/// sound settings. Recording devices are recorded through Media Foundation, playback devices by
+/// WASAPI loopback.
+/// </summary>
 internal static class AudioDevices
 {
+    public static readonly IAudioEndpoints System = new SystemEndpoints();
+
+    public static StringComparer IdComparer => StringComparer.OrdinalIgnoreCase;
+
+    /// <summary>"recording device" or "playback device".</summary>
+    public static string Describe(AudioDeviceKind kind) => kind == AudioDeviceKind.Input ? "recording device" : "playback device";
+
+    /// <summary>The connected devices: recording devices, then playback devices, each kind by name, numbered from 1.</summary>
     public static IReadOnlyList<AudioDeviceInfo> Enumerate()
     {
-        var devices = new List<AudioDeviceInfo>();
-        IMFAttributes attributes = CreateAudioCaptureAttributes();
-        try
+        List<AudioDeviceInfo> devices = WithEnumerator(enumerator =>
         {
-            if (Mf.Failed(MFExtern.MFEnumDeviceSources(attributes, out IMFActivate[] activates, out int count)) || activates is null)
+            string? defaultInput = GetDefaultId(enumerator, AudioDeviceKind.Input);
+            string? defaultOutput = GetDefaultId(enumerator, AudioDeviceKind.Output);
+            var found = new List<AudioDeviceInfo>();
+
+            Check(Wasapi.EnumAudioEndpoints(enumerator, Wasapi.DEVICE_STATE_ACTIVE, out IntPtr collection), "list the audio devices");
+            try
             {
-                return devices;
+                Check(Wasapi.GetCount(collection, out uint count), "list the audio devices");
+                for (uint i = 0; i < count; i++)
+                {
+                    if (Wasapi.GetItem(collection, i, out IntPtr device) < 0)
+                    {
+                        continue;
+                    }
+
+                    try
+                    {
+                        if (Read(device) is { } info)
+                        {
+                            string? defaultId = info.Kind == AudioDeviceKind.Input ? defaultInput : defaultOutput;
+                            found.Add(info with { IsDefault = IdComparer.Equals(info.Id, defaultId) });
+                        }
+                    }
+                    finally
+                    {
+                        Wasapi.Release(ref device);
+                    }
+                }
+            }
+            finally
+            {
+                Wasapi.Release(ref collection);
             }
 
-            for (int i = 0; i < count; i++)
-            {
-                string name = Mf.GetString(activates[i], MFAttributesClsid.MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME) ?? $"Audio device {i}";
-                string id = Mf.GetString(activates[i], MFAttributesClsid.MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_AUDCAP_ENDPOINT_ID) ?? string.Empty;
-                devices.Add(new AudioDeviceInfo(i, name, id));
-                Mf.Release(activates[i]);
-            }
+            return found;
+        });
+
+        return
+        [
+            .. devices
+                .OrderBy(device => device.Kind)
+                .ThenBy(device => device.Name, StringComparer.CurrentCultureIgnoreCase)
+                .Select((device, index) => device with { Number = index + 1 }),
+        ];
+    }
+
+    /// <summary>The device with this ID, connected or not; null when Windows does not know it.</summary>
+    public static AudioDeviceInfo? Get(string id) => WithEnumerator(enumerator =>
+    {
+        if (string.IsNullOrWhiteSpace(id) || Wasapi.GetDevice(enumerator, id, out IntPtr device) < 0)
+        {
+            return null;
+        }
+
+        try
+        {
+            return Read(device);
         }
         finally
         {
-            Mf.Release(attributes);
+            Wasapi.Release(ref device);
         }
+    });
 
-        return devices;
-    }
+    /// <summary>The ID of Windows' default device of a kind, or null when there is none.</summary>
+    public static string? GetDefaultId(AudioDeviceKind kind) => WithEnumerator(enumerator => GetDefaultId(enumerator, kind));
 
     /// <summary>
-    /// Opens a capture device. <paramref name="selector"/> is a device number from <see cref="Enumerate"/>
-    /// or part of a device name; null opens the system default recording device.
+    /// A connected device by its number in <see cref="Enumerate"/> or by its name or part of it.
+    /// Throws <see cref="ArgumentException"/> if that matches no device or several.
     /// </summary>
-    public static IMFMediaSource Open(string? selector, out string deviceName)
+    public static AudioDeviceInfo Find(string selector)
     {
-        IMFAttributes attributes = CreateAudioCaptureAttributes();
+        IReadOnlyList<AudioDeviceInfo> devices = Enumerate();
+        string text = selector.Trim();
+
+        if (int.TryParse(text, out int number))
+        {
+            return devices.FirstOrDefault(device => device.Number == number)
+                ?? throw new ArgumentException($"Audio device {number} does not exist. Use --list-devices to see the available devices.");
+        }
+
+        if (devices.FirstOrDefault(device => device.Name.Equals(text, StringComparison.CurrentCultureIgnoreCase)) is { } exact)
+        {
+            return exact;
+        }
+
+        List<AudioDeviceInfo> matches = [.. devices.Where(device => device.Name.Contains(text, StringComparison.CurrentCultureIgnoreCase))];
+        return matches.Count switch
+        {
+            1 => matches[0],
+            0 => throw new ArgumentException($"No audio device has a name containing \"{text}\". Use --list-devices to see the available devices."),
+            _ => throw new ArgumentException($"\"{text}\" matches {matches.Count} audio devices ({string.Join("; ", matches.Select(m => m.Name))}). Use more of the name, or the device number."),
+        };
+    }
+
+    /// <summary>A Media Foundation source for a recording device.</summary>
+    public static IMFMediaSource OpenInput(AudioDeviceInfo device)
+    {
+        IMFAttributes attributes = Mf.CreateAttributes(2);
         try
         {
-            if (selector is null)
-            {
-                deviceName = "default recording device";
-                Mf.Check(
-                    attributes.SetUINT32(MFAttributesClsid.MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_AUDCAP_ROLE, (int)ERole.eConsole),
-                    "Select default audio device");
-            }
-            else
-            {
-                AudioDeviceInfo device = Find(selector);
-                deviceName = device.Name;
-                Mf.Check(
-                    attributes.SetString(MFAttributesClsid.MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_AUDCAP_ENDPOINT_ID, device.EndpointId),
-                    "Select audio device");
-            }
-
-            Mf.Check(MFExtern.MFCreateDeviceSource(attributes, out IMFMediaSource source), $"Open audio device ({deviceName})");
+            Mf.Check(
+                attributes.SetGUID(MFAttributesClsid.MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE, CLSID.MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_AUDCAP_GUID),
+                "Set device source type");
+            Mf.Check(
+                attributes.SetString(MFAttributesClsid.MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_AUDCAP_ENDPOINT_ID, device.Id),
+                "Select audio device");
+            Mf.Check(MFExtern.MFCreateDeviceSource(attributes, out IMFMediaSource source), $"Open audio device ({device.Name})");
             return source;
         }
         finally
@@ -73,33 +175,64 @@ internal static class AudioDevices
         }
     }
 
-    /// <summary>Resolves an index or name fragment to a device; throws <see cref="ArgumentException"/> if it matches none or several.</summary>
-    public static AudioDeviceInfo Find(string selector)
+    private static string? GetDefaultId(IntPtr enumerator, AudioDeviceKind kind)
     {
-        IReadOnlyList<AudioDeviceInfo> devices = Enumerate();
-
-        if (int.TryParse(selector, out int number))
+        int dataFlow = kind == AudioDeviceKind.Input ? Wasapi.EDataFlowCapture : Wasapi.EDataFlowRender;
+        if (Wasapi.GetDefaultAudioEndpoint(enumerator, dataFlow, out IntPtr device) < 0)
         {
-            return number >= 1 && number <= devices.Count
-                ? devices[number - 1]
-                : throw new ArgumentException($"Audio device {number} does not exist. Use --list-devices to see the available devices.");
+            return null; // E_NOTFOUND: there are no devices of this kind
         }
 
-        List<AudioDeviceInfo> matches = devices.Where(d => d.Name.Contains(selector, StringComparison.OrdinalIgnoreCase)).ToList();
-        return matches.Count switch
+        try
         {
-            1 => matches[0],
-            0 => throw new ArgumentException($"No audio recording device has a name containing \"{selector}\". Use --list-devices to see the available devices."),
-            _ => throw new ArgumentException($"\"{selector}\" matches {matches.Count} audio devices ({string.Join("; ", matches.Select(m => m.Name))}). Use a longer name or the device number."),
-        };
+            return Wasapi.GetId(device, out string id) >= 0 ? id : null;
+        }
+        finally
+        {
+            Wasapi.Release(ref device);
+        }
     }
 
-    private static IMFAttributes CreateAudioCaptureAttributes()
+    private static AudioDeviceInfo? Read(IntPtr device)
     {
-        IMFAttributes attributes = Mf.CreateAttributes(2);
-        Mf.Check(
-            attributes.SetGUID(MFAttributesClsid.MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE, CLSID.MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_AUDCAP_GUID),
-            "Set device source type");
-        return attributes;
+        if (Wasapi.GetId(device, out string id) < 0 || Wasapi.GetDataFlow(device, out int dataFlow) < 0)
+        {
+            return null;
+        }
+
+        bool connected = Wasapi.GetState(device, out uint state) >= 0 && state == Wasapi.DEVICE_STATE_ACTIVE;
+        AudioDeviceKind kind = dataFlow == Wasapi.EDataFlowCapture ? AudioDeviceKind.Input : AudioDeviceKind.Output;
+        return new AudioDeviceInfo(id, Wasapi.GetFriendlyName(device) ?? id, kind) { IsConnected = connected };
+    }
+
+    private static T WithEnumerator<T>(Func<IntPtr, T> use)
+    {
+        Check(Wasapi.CreateDeviceEnumerator(out IntPtr enumerator), "open the audio device list");
+        try
+        {
+            return use(enumerator);
+        }
+        finally
+        {
+            Wasapi.Release(ref enumerator);
+        }
+    }
+
+    private static void Check(int hr, string action)
+    {
+        if (hr < 0)
+        {
+            throw new InvalidOperationException($"Could not {action} (0x{hr:X8}).");
+        }
+    }
+
+    private sealed class SystemEndpoints : IAudioEndpoints
+    {
+        public string? GetDefaultId(AudioDeviceKind kind) => AudioDevices.GetDefaultId(kind);
+
+        public AudioDeviceInfo? Get(string id) => AudioDevices.Get(id);
+
+        public IAudioSource Open(AudioDeviceInfo device, MediaClock clock) =>
+            device.Kind == AudioDeviceKind.Input ? new MicrophoneSource(device, clock) : new LoopbackSource(device, clock);
     }
 }

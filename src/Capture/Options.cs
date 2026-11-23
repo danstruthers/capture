@@ -56,9 +56,13 @@ internal sealed class Options
 
         Audio
           --audio-source <src>   microphone, desktop (what the PC is playing), both or
-                                 none (default: microphone). Viewers can switch it.
-          --audio-device <id>    Microphone to use: a number from --list-devices or part
-                                 of its name (default: the system default device)
+                                 none (default: microphone): Windows' default recording
+                                 and playback devices. Viewers can choose any devices.
+          --audio-device <id>    Record this device: a number from --list-devices or part
+                                 of its name. Repeat it for several. A recording device
+                                 takes the place of the default microphone; a playback
+                                 device (recorded as what it plays) that of the default
+                                 desktop audio.
           --no-audio             No audio at all (no audio track, nothing to switch on)
 
         Recording
@@ -126,7 +130,8 @@ internal sealed class Options
 
     public AudioSourceKind AudioSource { get; private set; } = AudioSourceKind.Microphone;
 
-    public string? AudioDevice { get; private set; }
+    /// <summary>Devices to record (--audio-device), as given: numbers or parts of names. Looked up when capture starts.</summary>
+    public List<string> AudioDeviceSelectors { get; } = [];
 
     public bool Audio { get; private set; } = true;
 
@@ -333,7 +338,7 @@ internal sealed class Options
                 case "--cursor": DrawCursor = true; break;
                 case "--no-cursor": DrawCursor = false; break;
                 case "--audio-source": AudioSource = ParseAudioSource(name, Value()); break;
-                case "--audio-device": AudioDevice = Value(); break;
+                case "--audio-device": AudioDeviceSelectors.Add(ParseText(name, Value())); break;
                 case "--audio": Audio = true; break;
                 case "--no-audio": Audio = false; break;
                 case "--output-dir": OutputDirectory = ParseFolder(name, Value()); break;
@@ -443,6 +448,9 @@ internal sealed class Options
 
         return expanded;
     }
+
+    private static string ParseText(string name, string text) =>
+        string.IsNullOrWhiteSpace(text) ? throw new ArgumentException($"{name} needs a value.") : text.Trim();
 
     private static int ParseInt(string name, string text, int min, int max)
     {

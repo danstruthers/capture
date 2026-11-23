@@ -95,14 +95,17 @@
             <option value="30"></option>
             <option value="60"></option>
           </datalist>
+        </div>
+      </section>
 
-          <label for="audio-source">Audio source</label>
-          <select id="audio-source" disabled>
-            <option value="microphone">Microphone</option>
-            <option value="desktop">Desktop audio</option>
-            <option value="both">Both, mixed</option>
-            <option value="none">None (silence)</option>
-          </select>
+      <section id="audio-devices" aria-label="Audio devices">
+        <h2>Audio devices</h2>
+        <p id="audio-note" class="note">Connect to see the audio devices.</p>
+        <div id="audio-groups" hidden>
+          <p class="device-group" id="audio-inputs-label">Recording devices</p>
+          <ul id="audio-inputs" class="devices" aria-labelledby="audio-inputs-label"></ul>
+          <p class="device-group" id="audio-outputs-label">Playback devices · recorded as what they play</p>
+          <ul id="audio-outputs" class="devices" aria-labelledby="audio-outputs-label"></ul>
         </div>
       </section>
 

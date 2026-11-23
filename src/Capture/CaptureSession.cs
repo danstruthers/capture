@@ -28,6 +28,7 @@ internal sealed class CaptureSession : IRemoteControl, IDisposable
     private readonly object _layoutLock = new();
     private readonly object _demandLock = new();
     private readonly Dictionary<string, VideoStats> _lastStats = [];
+    private readonly object _audioDeviceLock = new();
 
     private volatile VideoPipeline[] _pipelines = [];
     private volatile int _frameRate;
@@ -35,6 +36,8 @@ internal sealed class CaptureSession : IRemoteControl, IDisposable
     private IReadOnlyList<DisplayInfo> _displays;
     private Timer? _statsTimer;
     private Timer? _stateTimer;
+    private IReadOnlyList<AudioDeviceInfo> _audioDevices = [];
+    private long? _audioDevicesListedAt;
     private long _lastAudioFrames;
     private long _lastStatsTime;
     private bool _wasIdle;
@@ -66,13 +69,10 @@ internal sealed class CaptureSession : IRemoteControl, IDisposable
         {
             if (options.Audio)
             {
-                if (options.AudioDevice is not null)
-                {
-                    AudioDevices.Find(options.AudioDevice); // fail now, not when the microphone is first needed
-                }
-
-                _audio = new AudioMixer(_clock, options.AudioDevice, options.AudioSource);
-                Log.Info($"Audio: {AudioMixer.Describe(options.AudioSource)} -> 16-bit PCM, {PcmFormat.SampleRate} Hz, mono");
+                // Looked up now, so that a device that does not exist is reported at once rather than when audio is first needed.
+                AudioDeviceInfo[] devices = [.. options.AudioDeviceSelectors.Select(AudioDevices.Find)];
+                _audio = new AudioMixer(_clock, AudioDevices.System, AudioSelection.FromOptions(options.AudioSource, devices));
+                Log.Info($"Audio: {DescribeAudioSelection(_audio)} -> 16-bit PCM, {PcmFormat.SampleRate} Hz, mono");
             }
             else
             {
@@ -221,13 +221,7 @@ internal sealed class CaptureSession : IRemoteControl, IDisposable
                     hardware = pipeline.EncoderIsHardware,
                 };
             }).ToArray(),
-            audio = new
-            {
-                enabled = _audio is not null,
-                source = (_audio?.Source ?? AudioSourceKind.None).ToString().ToLowerInvariant(),
-                description = _audio?.Description,
-                sampleRate = PcmFormat.SampleRate,
-            },
+            audio = DescribeAudio(),
         });
     }
 
@@ -286,18 +280,23 @@ internal sealed class CaptureSession : IRemoteControl, IDisposable
                     break;
 
                 case "audioSource":
-                    if (!Enum.TryParse(setting.Value.GetString(), ignoreCase: true, out AudioSourceKind source) || !Enum.IsDefined(source))
+                    if (setting.Value.ValueKind != JsonValueKind.String
+                        || !Enum.TryParse(setting.Value.GetString(), ignoreCase: true, out AudioSourceKind source)
+                        || !Enum.IsDefined(source))
                     {
                         throw new InvalidOperationException("The audio source has to be microphone, desktop, both or none.");
                     }
 
-                    if (_audio is null)
+                    SetAudioSelection(AudioSelection.For(source));
+                    break;
+
+                case "audioDevices":
+                    if (setting.Value.ValueKind != JsonValueKind.Array || setting.Value.EnumerateArray().Any(entry => entry.ValueKind != JsonValueKind.String))
                     {
-                        throw new InvalidOperationException("Audio is turned off on the capture client (--no-audio).");
+                        throw new InvalidOperationException("audioDevices has to be a list of the ids in the state's audio.devices.");
                     }
 
-                    _audio.SetSource(source);
-                    Log.Info($"Audio source is now {AudioMixer.Describe(source)}.");
+                    SetAudioSelection([.. setting.Value.EnumerateArray().Select(entry => entry.GetString()!)]);
                     break;
 
                 default:
@@ -401,6 +400,17 @@ internal sealed class CaptureSession : IRemoteControl, IDisposable
         Log.Debug($"Shut down: {string.Join(", ", steps)}.");
     }
 
+    /// <summary>"the default recording device (Microphone (USB Audio)) + Speakers (Realtek(R) Audio)".</summary>
+    private static string DescribeAudioSelection(AudioMixer audio)
+    {
+        IReadOnlyList<AudioInputStatus> inputs = audio.GetInputs();
+        return inputs.Count == 0
+            ? "nothing (silence)"
+            : string.Join(" + ", inputs.Select(input => AudioSelection.KindOfDefault(input.Id) is { } kind
+                ? $"the default {AudioDevices.Describe(kind)} ({input.Device?.Name ?? "there is none"})"
+                : input.Device?.Name ?? input.Id));
+    }
+
     private static string Describe(VideoMode mode) => mode == VideoMode.Jpeg ? "JPEG over WebSocket" : "H.264 over WebRTC";
 
     private static string Describe(ScreenLayout layout) => layout == ScreenLayout.Desktop ? "whole-desktop" : "separate-screens";
@@ -467,6 +477,131 @@ internal sealed class CaptureSession : IRemoteControl, IDisposable
         _pipelines = pipelines;
         _recorder.SetSources([.. pipelines.Select(p => new RecordingSource(p.Area.Id, () => p.Config, p.RequestKeyFrame))]);
         _server?.SetSources([.. pipelines.Select(p => new StreamSource(p.Area.Id, p.Area.Number, p.RequestKeyFrame))]);
+    }
+
+    private void SetAudioSelection(string[] entries)
+    {
+        AudioMixer audio = _audio ?? throw new InvalidOperationException("Audio is turned off on the capture client (--no-audio).");
+        IReadOnlyList<string> before = audio.Selection;
+        audio.SetSelection(entries);
+        if (!audio.Selection.SequenceEqual(before))
+        {
+            Log.Info($"Audio is now recorded from {DescribeAudioSelection(audio)}.");
+        }
+    }
+
+    /// <summary>The "audio" part of the state.</summary>
+    private object DescribeAudio()
+    {
+        if (_audio is null)
+        {
+            return new { enabled = false, source = "none", selected = Array.Empty<string>(), description = (string?)null, sampleRate = PcmFormat.SampleRate, devices = Array.Empty<object>() };
+        }
+
+        IReadOnlyList<string> selection = _audio.Selection;
+        return new
+        {
+            enabled = true,
+            source = AudioSelection.AsSource([.. selection])?.ToString().ToLowerInvariant() ?? "devices",
+            selected = selection,
+            description = _audio.Description,
+            sampleRate = PcmFormat.SampleRate,
+            devices = ListAudioDevices(_audio),
+        };
+    }
+
+    /// <summary>
+    /// Every audio device a viewer can choose from: for each kind, the entry for Windows' default
+    /// device, the connected devices, and any selected device that is not connected. Each says
+    /// whether it is selected and how it is doing.
+    /// </summary>
+    private object[] ListAudioDevices(AudioMixer audio)
+    {
+        IReadOnlyList<AudioInputStatus> inputs = audio.GetInputs();
+        IReadOnlyList<AudioDeviceInfo> connected = ConnectedAudioDevices();
+        Dictionary<string, AudioInputStatus> statusOf = inputs.ToDictionary(input => input.Id, AudioDevices.IdComparer);
+
+        // A device can be recorded without its own entry being selected: through the default-device entry.
+        Dictionary<string, AudioInputStatus> capturing = inputs
+            .Where(input => input.State == AudioInputState.Capturing)
+            .DistinctBy(input => input.Device!.Id, AudioDevices.IdComparer)
+            .ToDictionary(input => input.Device!.Id, AudioDevices.IdComparer);
+
+        object Entry(string id, AudioDeviceKind kind, string name, bool present, bool isDefault = false, string? device = null)
+        {
+            statusOf.TryGetValue(id, out AudioInputStatus? status);
+            AudioInputStatus? live = status?.State == AudioInputState.Capturing ? status : capturing.GetValueOrDefault(id);
+            return new
+            {
+                id,
+                kind = kind == AudioDeviceKind.Input ? "input" : "output",
+                name,
+                device,
+                @default = isDefault,
+                present,
+                selected = status is not null,
+                status = status?.State switch
+                {
+                    AudioInputState.Idle => "idle",
+                    AudioInputState.Starting => "starting",
+                    AudioInputState.Unavailable => "unavailable",
+                    _ => live is not null ? "capturing" : "off",
+                },
+                problem = status?.Problem,
+                format = live?.Format,
+            };
+        }
+
+        var entries = new List<object>();
+        foreach (AudioDeviceKind kind in new[] { AudioDeviceKind.Input, AudioDeviceKind.Output })
+        {
+            // While capturing, the device actually recorded; otherwise the default as last listed, which is fresher.
+            string defaultEntry = AudioSelection.DefaultFor(kind);
+            AudioDeviceInfo? current = statusOf.GetValueOrDefault(defaultEntry) is { State: not AudioInputState.Idle } recorded
+                ? recorded.Device
+                : connected.FirstOrDefault(device => device.Kind == kind && device.IsDefault);
+            entries.Add(Entry(defaultEntry, kind, $"Default {AudioDevices.Describe(kind)}", present: current is not null, device: current?.Name));
+
+            foreach (AudioDeviceInfo device in connected.Where(device => device.Kind == kind))
+            {
+                entries.Add(Entry(device.Id, kind, device.Name, present: true, isDefault: device.IsDefault));
+            }
+
+            foreach (AudioInputStatus input in inputs)
+            {
+                bool missing = !AudioSelection.IsDefault(input.Id) && !connected.Any(device => AudioDevices.IdComparer.Equals(device.Id, input.Id));
+                if (missing && (input.Device?.Kind ?? AudioDeviceKind.Input) == kind)
+                {
+                    entries.Add(Entry(input.Id, kind, input.Device?.Name ?? input.Id, present: false));
+                }
+            }
+        }
+
+        return [.. entries];
+    }
+
+    /// <summary>The connected audio devices, listed again at most every two seconds: the state goes out every second.</summary>
+    private IReadOnlyList<AudioDeviceInfo> ConnectedAudioDevices()
+    {
+        lock (_audioDeviceLock)
+        {
+            long now = Environment.TickCount64;
+            if (_audioDevicesListedAt is not { } listedAt || now - listedAt >= 2000)
+            {
+                try
+                {
+                    _audioDevices = AudioDevices.Enumerate();
+                }
+                catch (Exception ex)
+                {
+                    Log.Debug($"Listing the audio devices failed: {ex.Message}");
+                }
+
+                _audioDevicesListedAt = now;
+            }
+
+            return _audioDevices;
+        }
     }
 
     private void SetFrameRate(int fps)

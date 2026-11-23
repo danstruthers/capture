@@ -7,8 +7,8 @@
     drives it through its controls over the DevTools protocol: watching every screen over H.264,
     choosing which screens to watch, zooming, popping a screen out into its own window, starting,
     pausing, resuming and stopping a recording, changing the frame rate, switching to JPEG pictures
-    and back, switching the audio source, pausing, stopping and starting the stream, and switching
-    between separate screens and the whole desktop.
+    and back, choosing which audio devices are recorded, pausing, stopping and starting the stream,
+    and switching between separate screens and the whole desktop.
 
     Every check is made on numbers and states the pages report (frames shown, codec, recording
     state, ...). The test never looks at the picture itself.
@@ -137,6 +137,11 @@ function Set-Field([string]$id, [string]$value) {
     Get-Js "(() => { const field = document.getElementById('$id'); field.value = '$value'; field.dispatchEvent(new Event('change')); })()" | Out-Null
 }
 
+# Ticks or unticks an audio device in the page's Audio devices list.
+function Switch-AudioDevice([string]$id) {
+    Get-Js "[...document.querySelectorAll('#audio-devices input')].find(box => box.dataset.device === '$id').click()" | Out-Null
+}
+
 $processes = @()
 try {
     Write-Host "Starting the capture client, the viewer host and Edge (output in $work)"
@@ -230,7 +235,8 @@ try {
     Invoke-Click '#recording-stop'
     Assert-Eventually 'recording stops' "$state.recording.state === 'stopped'"
     $deadline = (Get-Date).AddSeconds(10)
-    while ((Get-Date) -lt $deadline -and @(Select-String -Path $captureLog -Pattern 'Saved ').Count -lt $sources.Count) { Start-Sleep -Milliseconds 250 }
+    # Case-sensitive: "Recordings are saved in ..." at startup must not count.
+    while ((Get-Date) -lt $deadline -and @(Select-String -Path $captureLog -CaseSensitive -Pattern 'Saved .*\.mp4').Count -lt $sources.Count) { Start-Sleep -Milliseconds 250 }
     $recordings = @(Get-ChildItem $work -Filter *.mp4)
     Assert-That 'an MP4 file was saved for every stream' ($recordings.Count -eq $sources.Count -and -not ($recordings | Where-Object Length -lt 20KB)) "found: $(($recordings | ForEach-Object { "$($_.Name) $($_.Length) bytes" }) -join ', ')"
 
@@ -249,13 +255,27 @@ try {
     if ($hasAudio) {
         Assert-Eventually 'PCM audio arrives' "${stats}?.audio?.codec?.startsWith('PCM') && $stats.audio.packetsReceived > 50"
 
-        Write-Host 'Audio source'
-        Set-Field 'audio-source' 'desktop'
-        Assert-Eventually 'desktop audio is selected' "$state.audio.source === 'desktop'"
-        Set-Field 'audio-source' 'both'
-        Assert-Eventually 'microphone and desktop audio are mixed' "$state.audio.source === 'both'"
-        Set-Field 'audio-source' 'microphone'
-        Assert-Eventually 'the microphone is selected again' "$state.audio.source === 'microphone'"
+        Write-Host 'Audio devices'
+        Assert-Eventually 'the page lists every audio device with a tick box' "$state.audio.devices.length >= 2 && document.querySelectorAll('#audio-devices input[type=checkbox]').length === $state.audio.devices.length"
+        Assert-That 'each group starts with the Windows default' ((Get-Js "['input', 'output'].every(kind => $state.audio.devices.find(d => d.kind === kind).id === 'default-' + kind)") -eq $true)
+        $selectedAtStart = Get-Js "JSON.stringify($state.audio.selected)"
+        $output = Get-Js "$state.audio.devices.find(d => d.kind === 'output' && d.present && !d.id.startsWith('default-'))?.id ?? null"
+        if ($output -and $selectedAtStart -eq '["default-input"]') {
+            Switch-AudioDevice $output
+            Assert-Eventually 'a playback device is recorded as well' "$state.audio.selected.includes('$output') && $state.audio.devices.find(d => d.id === '$output').status === 'capturing'" 20
+            Switch-AudioDevice 'default-input'
+            Assert-Eventually 'the default recording device is no longer recorded' "!$state.audio.selected.includes('default-input') && $state.audio.selected.length === 1"
+            $before = [int](Get-Js "$stats.audio.packetsReceived")
+            Start-Sleep -Seconds 2
+            Assert-That 'audio keeps arriving from the playback device' ([int](Get-Js "$stats.audio.packetsReceived") -gt $before + 50)
+            Switch-AudioDevice $output
+            Assert-Eventually 'with nothing ticked the page says the audio is silence' "$state.audio.selected.length === 0 && document.getElementById('audio-note').textContent.includes('silence')"
+            Switch-AudioDevice 'default-input'
+            Assert-Eventually 'the default recording device is recorded again' "$state.audio.source === 'microphone' && ['capturing', 'starting'].includes($state.audio.devices[0].status)"
+        }
+        else {
+            Write-Host "  (skipped: needs a playback device and the default audio source; selected: $selectedAtStart)"
+        }
     }
 
     Write-Host 'Streaming control'

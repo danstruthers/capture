@@ -543,6 +543,70 @@ body.popout .placeholder {
   color: var(--text-muted);
 }
 
+/* Audio devices --------------------------------------------------------- */
+
+.device-group {
+  margin-top: 12px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.devices {
+  display: grid;
+  gap: 7px;
+  margin: 6px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.devices li {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 1px 10px;
+}
+
+.devices label {
+  display: contents;
+}
+
+.devices .device-name {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.devices .device-name.stand-in {
+  font-weight: 600;
+}
+
+.devices .device-detail {
+  grid-column: 2;
+  color: var(--text-muted);
+  font-family: var(--mono);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.devices .device-detail:empty {
+  display: none;
+}
+
+.devices li[data-status="capturing"] .device-detail {
+  color: var(--good);
+}
+
+.devices li[data-status="starting"] .device-detail {
+  color: var(--warn);
+}
+
+.devices li[data-status="unavailable"] .device-detail {
+  color: var(--bad);
+}
+
+.devices li[data-present="false"] .device-name {
+  color: var(--text-muted);
+}
+
 .pill[data-state="paused"] {
   border-color: var(--warn);
   color: var(--warn);

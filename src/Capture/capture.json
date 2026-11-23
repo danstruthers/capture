@@ -13,7 +13,9 @@
   // How viewers get video: "h264" (WebRTC) or "jpeg" (pictures over the WebSocket).
   "videoMode": "h264",
 
-  // What the audio is: "microphone", "desktop" (what the PC is playing), "both" or "none".
+  // What the audio is: "microphone", "desktop" (what the PC is playing), "both" or "none", meaning
+  // Windows' default devices. To record particular devices, add "audioDevice": ["2", "Headset"]
+  // (numbers or parts of names from "capture --list-devices"). Viewers can change it while running.
   "audioSource": "microphone",
 
   // Where recordings are saved. Environment variables work, e.g. "%USERPROFILE%\\Videos\\Capture".

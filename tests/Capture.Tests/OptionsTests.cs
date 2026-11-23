@@ -115,6 +115,15 @@ public sealed class OptionsTests : IDisposable
     }
 
     [Fact]
+    public void Audio_devices_can_be_given_several_times_and_as_a_list()
+    {
+        string config = Config("""{ "audioDevice": ["2", "Speakers (Realtek"] }""");
+
+        Assert.Equal(["2", "Speakers (Realtek", "USB"], Options.Load(["--config", config, "--audio-device", " USB "]).AudioDeviceSelectors);
+        Assert.Empty(Load().AudioDeviceSelectors);
+    }
+
+    [Fact]
     public void Command_line_overrides_the_configuration_file()
     {
         string config = Config("""{ "fps": 15, "record": false, "noAudio": true }""");
@@ -132,6 +141,7 @@ public sealed class OptionsTests : IDisposable
     [InlineData("--fps", "fast")]
     [InlineData("--video-mode", "vp8")]
     [InlineData("--audio-source", "everything")]
+    [InlineData("--audio-device", " ")]
     [InlineData("--bind", "not-an-address")]
     [InlineData("--jpeg-quality", "101")]
     [InlineData("--layout", "grid")]

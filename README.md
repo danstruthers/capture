@@ -8,11 +8,13 @@ streams them to viewers, plus a single-page web viewer for testing and remote co
 - **Video**: H.264, encoded once per stream and used for both the MP4 files and the live stream.
   A hardware encoder is used when the machine has a working one; otherwise the Microsoft software
   encoder.
-- **Audio**: 16-bit linear PCM at 8 kHz mono, from the microphone, from the desktop (what the PC is
-  playing), or both mixed.
+- **Audio**: 16-bit linear PCM at 8 kHz mono, mixed from any number of audio devices: recording
+  devices (microphones, line in) and playback devices (recorded as what they play). By default,
+  the Windows default microphone.
 - **Streaming**: WebRTC (H.264 + G.711), or as a fallback JPEG pictures and raw PCM over a WebSocket.
 - **Remote control**: viewers can start, stop, pause and resume recording and streaming, change the
-  frame rate, and switch the screen layout, the video method and the audio source.
+  frame rate, switch the screen layout and the video method, and see every audio device and choose
+  which ones are recorded.
 - **Viewer**: shows each screen in its own tile; you choose which screens to watch, zoom each one
   with the mouse wheel, and pop any of them out into a window of its own.
 
@@ -43,12 +45,13 @@ finalizes the MP4 files, which are in your TEMP folder unless you set `--output-
 Useful variations:
 
 ```powershell
-capture --list-devices                    # screens, microphones, H.264 encoders
+capture --list-devices                    # screens, audio devices, H.264 encoders
 capture --layout desktop                  # all screens as one stream
 capture --screens 1                       # only screen 1
 capture --no-record --no-stream           # start idle; begin from the viewer
 capture --fps 15 --max-width 1280         # less CPU and bandwidth
-capture --audio-source both               # microphone + desktop audio
+capture --audio-source both               # default microphone + what the default speakers play
+capture --audio-device 2 --audio-device Headphones   # particular devices (numbers from --list-devices)
 capture --video-mode jpeg                 # JPEG pictures instead of WebRTC
 capture --no-server -o demo.mp4           # just record (to %TEMP%\demo.mp4)
 capture --output-dir D:\Recordings        # save recordings somewhere other than TEMP
@@ -70,7 +73,8 @@ false` in the file and `--record` / `--no-record` on the command line.
   "screens": [1, 2],             // which screens; leave out for all
   "fps": 30,                     // 1-60; viewers can change it while running
   "videoMode": "h264",           // "h264" (WebRTC) or "jpeg" (pictures over the WebSocket)
-  "audioSource": "microphone",   // "microphone", "desktop", "both" or "none"
+  "audioSource": "microphone",   // Windows' default devices: "microphone", "desktop", "both" or "none"
+  "audioDevice": ["Headset"],    // particular devices, by number or part of the name (see below)
   "outputDir": "%TEMP%",         // where recordings are saved (the default)
   "record": true,                // start recording at launch
   "stream": true,                // start streaming at launch
@@ -80,6 +84,12 @@ false` in the file and `--record` / `--no-record` on the command line.
 ```
 
 Screens are numbered from 1, in the order `capture --list-devices` shows them.
+
+Audio comes from Windows' default devices unless particular ones are named: `"microphone"` is the
+default recording device, `"desktop"` what the default playback device plays. Each `audioDevice`
+is recorded as well; a recording device named there takes the place of the default microphone,
+and a playback device that of the default desktop audio. Viewers can change all of this while
+the capture client runs.
 
 ## The viewer
 
@@ -97,8 +107,12 @@ JavaScript module, no build step or dependencies). The page talks to the capture
   screen to the main window. A pop-out window has its own connection to the capture client, asks
   for only its screen and plays no sound, so audio is never heard twice.
 - **Remote control**: Start / Pause / Stop for recording and for streaming, the layout, the video
-  method, the frame rate and the audio source. The panel always shows the capture client's actual
-  state.
+  method and the frame rate. The panel always shows the capture client's actual state.
+- **Audio devices**: every recording device and every playback device of the capture client's PC,
+  each with a tick box: ticked devices are mixed into the audio. Each group starts with **Default
+  device**, which follows Windows' default. Under each device: whether it is live (and the format
+  it delivers), starting, idle (nothing is being recorded or watched), or why it cannot be
+  recorded. The list is refreshed every couple of seconds, so plugging in a headset shows up.
 - `?url=ws://host:8081/` presets the address and `?autoconnect` connects on load.
 - In the browser console, `captureViewer.stats` and `captureViewer.state` hold the latest numbers.
 
@@ -112,10 +126,10 @@ for each stream (each screen, or the whole desktop):
                   │                                                                    └─► WebRTC track
                   └─► JPEG encoder ────────────────────────────────────────────────────► WebSocket
 
-microphone (MF source reader) ──► resampler MFT ─┐
-desktop audio (WASAPI loopback) ─► resampler MFT ┴─► mixer: 20 ms frames, 8 kHz PCM ─┬─► AAC in every MP4
-                                                                                     ├─► G.711 over WebRTC
-                                                                                     └─► PCM over WebSocket
+each recording device (MF source reader) ─► resampler MFT ─┐
+each playback device (WASAPI loopback) ───► resampler MFT ─┴─► mixer: 20 ms frames, 8 kHz PCM ─┬─► AAC in every MP4
+                                                                                               ├─► G.711 over WebRTC
+                                                                                               └─► PCM over WebSocket
 ```
 
 - **Nothing runs unless it is needed.** A stream is only captured while it is recorded or while a
@@ -124,6 +138,13 @@ desktop audio (WASAPI loopback) ─► resampler MFT ┴─► mixer: 20 ms fram
 - **One clock.** Video frames are stamped when captured; audio is placed by the devices' own
   timestamps on the same clock, so sound and pictures line up across all streams, in the files and
   in the stream.
+- **Audio devices** open in the background, side by side, and each joins the mix when it is ready:
+  some take seconds to start (a monitor's speakers over HDMI have to wake up), and that holds up
+  neither the other devices nor whatever turned audio on. While audio is in use the devices are
+  looked at every two seconds. A device that stopped or was unplugged is opened again when it is
+  back; one that will not open is tried again less and less often, up to once a minute. A **Default
+  device** entry moves to the new default when Windows' default changes, and if it and the device
+  it stands for are both ticked, that device is recorded once.
 - **The desktop stream** composes the screens into one picture as they are arranged; parts of the
   desktop rectangle no screen covers (screens of different heights) are black. H.264 encoders take
   at most 4096 × 2304, so a wider desktop is scaled down to fit (two side-by-side screens of 2560
@@ -207,11 +228,26 @@ To the capture client:
 |---|---|
 | `{"type":"select","sources":["screen1"],"audio":true}` | Which streams this client wants, and whether it wants sound. Until a client says, it gets everything. Allowed even when remote control is off. |
 | `{"type":"command","target":"recording","action":"start"}` | `target`: `recording` or `streaming`; `action`: `start`, `stop`, `pause`, `resume`. |
-| `{"type":"configure","frameRate":15}` | Also `"layout":"separate"\|"desktop"`, `"videoMode":"h264"\|"jpeg"` and `"audioSource":"microphone"\|"desktop"\|"both"\|"none"`. |
+| `{"type":"configure","frameRate":15}` | Also `"layout":"separate"\|"desktop"`, `"videoMode":"h264"\|"jpeg"`, `"audioDevices":["default-input","{0.0.0.00000000}.{…}"]` (exactly the devices to record) and `"audioSource":"microphone"\|"desktop"\|"both"\|"none"` (shorthand for the default devices). |
 | `{"type":"answer","sdp":"…"}` | WebRTC answer. |
 | `{"candidate":"…","sdpMid":"…","sdpMLineIndex":0}` | ICE candidate. |
 
 A client can also choose up front, in the address: `ws://host:8081/?select=screen2&audio=0`.
+
+The state's `audio` has `enabled`, `selected` (the ids being recorded), `source` (`microphone`,
+`desktop`, `both` or `none` when the selection is just default devices, otherwise `devices`),
+`description` and `devices`. Each entry of `devices` has:
+
+- `id`: the Windows endpoint ID, or `default-input` / `default-output` for the entries that stand
+  for Windows' default recording and playback device;
+- `kind` (`input` for recording devices, `output` for playback devices), `name`, `default`
+  (whether it is Windows' default), `present` (connected), and for the default entries `device`,
+  the name of the device they stand for;
+- `selected`, `status` (`off`, `idle`, `starting`, `capturing` or `unavailable`), `problem`
+  (why it is unavailable) and `format` (what it delivers while captured).
+
+Selecting a device that cannot be recorded is refused with an `error` message, and the selection
+stays as it was.
 
 In JPEG mode, media arrives as binary messages: a type byte, the stream number, a 64-bit
 little-endian timestamp in 100 ns units, then the payload.
@@ -249,17 +285,21 @@ Hardware encoders cannot be tested on a machine without one, so the asynchronous
 exercised with a simulated asynchronous transform wrapped around the software encoder
 (`AsyncTransformSimulator`).
 
+The audio mixer is tested with stand-in devices (which devices are open when, default-device
+entries, refusals, slow devices, devices that stop or will not open, the mix itself) and with
+this PC's real devices: every connected device is recorded at once.
+
 The end-to-end test also chooses screens, zooms, pops a screen out into its own window and back,
-and switches between the two layouts.
+ticks and unticks audio devices, and switches between the two layouts.
 
 ## Layout
 
 ```
 src/Capture/            the capture client
   Video/                screens and capture areas, capture, conversion, H.264 and JPEG encoding, the video pipeline
-  Audio/                microphone and loopback sources, timeline, mixer, resampler
+  Audio/                audio devices and selection, recording-device and loopback sources, timeline, mixer, resampler
   Output/               MP4 recorder, stream server (WebSocket, WebRTC, remote control)
-  Interop/              Media Foundation helpers; ICodecAPI, Direct3D/DXGI, WASAPI and Win32 declarations
+  Interop/              Media Foundation helpers; ICodecAPI, Direct3D/DXGI, Core Audio (WASAPI) and Win32 declarations
 src/Capture.Viewer/     static host and the viewer page (wwwroot)
 tests/Capture.Tests/    unit and round-trip tests
 tests/EndToEnd.ps1      end-to-end smoke test
@@ -278,7 +318,10 @@ tests/EndToEnd.ps1      end-to-end smoke test
 - Changes to the screens (a screen added or removed, a resolution change) are picked up when the
   layout is set again (from the viewer, or by restarting), not automatically.
 - Hardware encoders are fed system-memory NV12 frames; there is no Direct3D zero-copy path.
-- Desktop audio is the default playback device, reduced to 8 kHz mono like everything else.
+- Every audio device is reduced to 8 kHz mono and the devices are simply added together, so
+  several loud devices at once can clip.
+- A playback device is recorded as what Windows sends to it; a device nothing is playing on
+  records silence.
 - WebRTC sending has no congestion control: it suits a LAN, not a constrained link.
 
 ## Third-party components

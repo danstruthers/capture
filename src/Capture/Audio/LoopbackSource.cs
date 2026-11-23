@@ -5,8 +5,8 @@ using MediaFoundation;
 namespace Capture.Audio;
 
 /// <summary>
-/// Records "desktop audio": whatever the default playback device is playing, taken with a WASAPI
-/// loopback stream and resampled to 8 kHz mono 16-bit PCM.
+/// Records what a playback device is playing ("desktop audio", for the default one), taken with a
+/// WASAPI loopback stream and resampled to 8 kHz mono 16-bit PCM.
 /// <para>
 /// A loopback stream delivers nothing while nothing is playing. That is fine here: every packet is
 /// placed on the timeline by its own timestamp, and the stretches in between read as silence.
@@ -18,6 +18,7 @@ internal sealed unsafe class LoopbackSource : IAudioSource
     private const int PollIntervalMs = 10;
     private const uint TimestampError = 0x4;
 
+    private readonly AudioDeviceInfo _device;
     private readonly MediaClock _clock;
     private readonly long _systemTimeOffset;
     private readonly Thread _thread;
@@ -26,8 +27,9 @@ internal sealed unsafe class LoopbackSource : IAudioSource
     private volatile bool _stopping;
     private bool _disposed;
 
-    public LoopbackSource(MediaClock clock)
+    public LoopbackSource(AudioDeviceInfo device, MediaClock clock)
     {
+        _device = device;
         _clock = clock;
 
         // Packet timestamps are performance-counter times, the same clock Media Foundation uses.
@@ -38,7 +40,8 @@ internal sealed unsafe class LoopbackSource : IAudioSource
         _thread.SetApartmentState(ApartmentState.MTA);
         _thread.Start();
 
-        if (!_started.Wait(TimeSpan.FromSeconds(5)))
+        // Starting can take seconds: a monitor's speakers have been seen to need nearly five to wake up.
+        if (!_started.Wait(TimeSpan.FromSeconds(10)))
         {
             _stopping = true;
             throw new TimeoutException("The playback device did not respond.");
@@ -51,7 +54,12 @@ internal sealed unsafe class LoopbackSource : IAudioSource
         }
     }
 
-    public string Name { get; private set; } = "desktop audio";
+    public string Name => _device.Name;
+
+    public string Format { get; private set; } = string.Empty;
+
+    /// <summary>The stream is polled every 10 ms.</summary>
+    public long Latency => 60 * 10_000;
 
     public AudioTimeline Timeline { get; } = new();
 
@@ -74,7 +82,12 @@ internal sealed unsafe class LoopbackSource : IAudioSource
     {
         if (hr < 0)
         {
-            string detail = hr == unchecked((int)0x80070490) ? "there is no playback device" : $"error 0x{hr:X8}";
+            string detail = hr switch
+            {
+                Wasapi.E_NOTFOUND => "the device is not there",
+                Wasapi.AUDCLNT_E_DEVICE_INVALIDATED => "the device was unplugged or turned off",
+                _ => $"error 0x{hr:X8}",
+            };
             throw new InvalidOperationException($"{operation} failed: {detail}.");
         }
     }
@@ -129,7 +142,7 @@ internal sealed unsafe class LoopbackSource : IAudioSource
             try
             {
                 Check(Wasapi.CreateDeviceEnumerator(out enumerator), "Opening the audio device list");
-                Check(Wasapi.GetDefaultPlaybackDevice(enumerator, out device), "Finding the default playback device");
+                Check(Wasapi.GetDevice(enumerator, _device.Id, out device), "Finding the playback device");
                 Check(Wasapi.ActivateAudioClient(device, out audioClient), "Opening the playback device");
                 Check(Wasapi.GetMixFormat(audioClient, out mixFormat), "Reading the playback format");
                 format = Wasapi.ReadFormat(mixFormat);
@@ -137,7 +150,7 @@ internal sealed unsafe class LoopbackSource : IAudioSource
                 Check(Wasapi.GetCaptureClient(audioClient, out captureClient), "Starting loopback capture");
                 resampler = CreateResampler(format);
                 Check(Wasapi.Start(audioClient), "Starting loopback capture");
-                Name = $"desktop audio ({format.SampleRate} Hz, {format.Channels} ch)";
+                Format = $"{format.SampleRate} Hz, {format.Channels} ch, {format.BitsPerSample}-bit {(format.IsFloat ? "float" : "PCM")}";
             }
             catch (Exception ex)
             {
@@ -183,13 +196,13 @@ internal sealed unsafe class LoopbackSource : IAudioSource
     {
         while (true)
         {
-            Check(Wasapi.GetNextPacketSize(captureClient, out uint pending), "Reading desktop audio");
+            Check(Wasapi.GetNextPacketSize(captureClient, out uint pending), "Reading the playback device");
             if (pending == 0)
             {
                 return;
             }
 
-            Check(Wasapi.GetBuffer(captureClient, out IntPtr data, out uint frames, out uint flags, out ulong qpcPosition), "Reading desktop audio");
+            Check(Wasapi.GetBuffer(captureClient, out IntPtr data, out uint frames, out uint flags, out ulong qpcPosition), "Reading the playback device");
             try
             {
                 // A packet flagged silent carries no usable data; leaving it out reads back as silence anyway.
