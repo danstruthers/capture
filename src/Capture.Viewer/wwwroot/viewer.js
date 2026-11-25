@@ -57,6 +57,9 @@ const el = {
   layout: byId('layout'),
   videoMode: byId('video-mode'),
   frameRate: byId('frame-rate'),
+  camera: byId('camera'),
+  cameraRate: byId('camera-rate'),
+  cameraNote: byId('camera-note'),
   audioDevices: byId('audio-devices'),
   audioNote: byId('audio-note'),
   audioGroups: byId('audio-groups'),
@@ -95,6 +98,7 @@ const statCells = {};
 
 let screenListKey = '';
 let audioListKey = '';
+let cameraListKey = '';
 
 /** The id of the last command or configure request; an error refusing a request carries its id. */
 let lastRequestId = 0;
@@ -112,10 +116,10 @@ function mainRole() {
     hasControls: true,
     playsAudio: true,
     socketAddress: (url) => url,
-    /** The streams to show, in the order the screens are arranged. */
+    /** The streams to show: the screens in the order they are arranged, then the camera. */
     wantedSources: (sources) => sources
       .filter((source) => !deselected.has(source.id) && !popouts.has(source.id))
-      .sort((a, b) => a.left - b.left || a.top - b.top),
+      .sort((a, b) => (a.kind === 'camera') - (b.kind === 'camera') || a.left - b.left || a.top - b.top),
     /** Title and text for the stage while streaming is on but no stream is shown. */
     describeNothingShown(state) {
       if (state.sources.length === 0) {
@@ -416,6 +420,7 @@ function render() {
   renderScreenList();
   showControls(state);
   renderAudioDevices(state);
+  renderCamera(state);
   el.pausedBadge.hidden = state?.streaming.state !== 'paused';
 }
 
@@ -512,6 +517,9 @@ function renderScreenList() {
     const detail = document.createElement('span');
     detail.className = 'screen-detail';
     const parts = [`${source.width} × ${source.height}`];
+    if (source.kind === 'camera') {
+      parts.push('camera');
+    }
     if (source.primary) {
       parts.push('primary');
     }
@@ -627,6 +635,9 @@ class Session {
     this.audioPending = null; // {ids, request, until}: an audio device change sent but not yet confirmed
     this.audioError = null;   // why the last audio device change was refused
     this.controlError = null; // why the last other command or setting was refused
+    this.cameraPending = null;  // {value, request, until}: a camera change sent but not yet confirmed
+    this.cameraRateRequest = 0; // the id of the last camera frame rate request
+    this.cameraError = null;    // why the last camera change was refused
 
     /** H.264 mode: the WebRTC connection; see acceptOffer and closePeer. */
     this.rtc = Session.noRtc();
@@ -763,6 +774,10 @@ async function handleMessage(s, data) {
         // The audio change just asked for was refused: the list goes back to what is recorded.
         s.audioPending = null;
         s.audioError = message.message;
+      } else if ((s.cameraPending && message.request === s.cameraPending.request) || (s.cameraRateRequest && message.request === s.cameraRateRequest)) {
+        // A camera change was refused: the Camera section says why, and shows the camera there is.
+        s.cameraPending = null;
+        s.cameraError = message.message;
       } else {
         s.controlError = message.message;
       }
@@ -892,6 +907,16 @@ function applyState(s, state) {
   if (s.audioPending && (sameMembers(s.audioPending.ids, state.audio.selected) || performance.now() > s.audioPending.until)) {
     s.audioPending = null;
   }
+  const camera = state.camera?.selected ?? 'none';
+  if ((previous?.camera?.selected ?? 'none') !== camera) {
+    log(camera === 'none' ? 'Camera: off' : `Camera: ${cameraName(state, camera)}`);
+  }
+  if (previous && previous.camera?.frameRate !== state.camera?.frameRate) {
+    log(`Camera frame rate is ${state.camera.frameRate} fps`);
+  }
+  if (s.cameraPending && (s.cameraPending.value === camera || performance.now() > s.cameraPending.until)) {
+    s.cameraPending = null;
+  }
 
 
   // Each transport only lives while the capture client is using it.
@@ -972,6 +997,94 @@ function showControls(state) {
   showControlNote(!state ? 'Connect to control the capture client.'
     : !state.remoteControl ? 'Remote control is turned off on the capture client.'
     : error ?? '', error ? 'error' : 'info');
+}
+
+// ---------------------------------------------------------------------------------------------
+// Camera: which one is captured, as a stream of its own, and at what frame rate
+// ---------------------------------------------------------------------------------------------
+
+function cameraName(state, id) {
+  return state?.camera?.devices.find((device) => device.id === id)?.name ?? 'a camera';
+}
+
+/** The camera chosen as far as this page knows: a change it asked for counts before the capture client confirms it. */
+function cameraChoice(s) {
+  return s?.cameraPending?.value ?? s?.state?.camera?.selected ?? 'none';
+}
+
+/** The line under the Camera heading, and its kind: how the camera is doing, or why it is not. */
+function describeCamera(state, s) {
+  const camera = state.camera;
+  const source = state.sources.find((candidate) => candidate.kind === 'camera');
+  if (s.cameraError) {
+    return [s.cameraError, 'error'];
+  }
+  if (s.cameraPending) {
+    return [s.cameraPending.value === 'none' ? 'Switching the camera off…' : `Opening ${cameraName(state, s.cameraPending.value)}…`, 'info'];
+  }
+  if (camera.problem) {
+    return [camera.problem.charAt(0).toUpperCase() + camera.problem.slice(1), 'error'];
+  }
+  if (source) {
+    const encoded = `H.264 ${source.videoWidth} × ${source.videoHeight} at ${source.frameRate} fps, ${source.hardware ? 'hardware' : 'software'} encoder`;
+    return [`${camera.mode} · ${source.capturing ? encoded : 'idle: nothing is recorded or watched'}`, 'info'];
+  }
+  if (camera.devices.length === 0) {
+    return ['The capture client has no camera.', 'info'];
+  }
+  return [state.remoteControl ? 'Choose a camera to capture it as well.' : 'Remote control is turned off on the capture client, so this cannot be changed here.', 'info'];
+}
+
+function renderCamera(state) {
+  const s = session;
+  const devices = state?.camera?.devices ?? [];
+  const choice = cameraChoice(s);
+  const canChange = Boolean(state?.remoteControl && state.camera);
+
+  const key = JSON.stringify([devices.map((device) => [device.id, device.name]), choice]);
+  if (key !== cameraListKey) {
+    cameraListKey = key;
+    el.camera.replaceChildren(new Option('Off', 'none'), ...devices.map((device) => new Option(device.name, device.id)));
+    el.camera.value = choice;
+  }
+  el.camera.disabled = !canChange || (devices.length === 0 && choice === 'none');
+  el.cameraRate.disabled = !canChange;
+  if (state?.camera && document.activeElement !== el.cameraRate && String(el.cameraRate.value) !== String(state.camera.frameRate)) {
+    el.cameraRate.value = state.camera.frameRate;
+  }
+
+  const [note, kind] = !state ? ['Connect to see the cameras.', 'info']
+    : !state.camera ? ['This capture client cannot capture a camera.', 'info']
+    : describeCamera(state, s);
+  el.cameraNote.textContent = note;
+  el.cameraNote.dataset.kind = kind;
+}
+
+function chooseCamera(value) {
+  const s = session;
+  if (!s?.state) {
+    return;
+  }
+  log(`Request: camera ${value === 'none' ? 'off' : cameraName(s.state, value)}`);
+  const request = sendRequest(configureMessage({ camera: value }));
+  s.cameraPending = { value, request, until: performance.now() + 10000 };
+  s.cameraError = null;
+  render();
+}
+
+function setCameraRate(value) {
+  const s = session;
+  if (!s?.state) {
+    return;
+  }
+  s.cameraError = null;
+  if (!Number.isInteger(value) || value < 1 || value > 60) {
+    s.cameraError = "The camera's frame rate has to be a whole number from 1 to 60.";
+  } else {
+    log(`Request: camera frame rate = ${value}`);
+    s.cameraRateRequest = sendRequest(configureMessage({ cameraFrameRate: value }));
+  }
+  render();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1716,6 +1829,8 @@ for (const target of ['recording', 'streaming']) {
   row.pause.addEventListener('click', () => sendCommand(target, session?.state?.[target].state === 'paused' ? 'resume' : 'pause'));
 }
 
+el.camera.addEventListener('change', () => chooseCamera(el.camera.value));
+el.cameraRate.addEventListener('change', () => setCameraRate(Number(el.cameraRate.value)));
 el.layout.addEventListener('change', () => configure('layout', el.layout.value));
 el.videoMode.addEventListener('change', () => configure('videoMode', el.videoMode.value));
 el.frameRate.addEventListener('change', () => {

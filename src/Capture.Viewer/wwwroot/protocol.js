@@ -2,7 +2,7 @@
 // src/Capture/Output/ViewerProtocol.cs; README.md ("WebSocket protocol") describes both.
 //
 // Text messages are JSON:
-//   capture -> viewer   {"type":"state", remoteControl, layout, recording, streaming, video, sources, audio}
+//   capture -> viewer   {"type":"state", remoteControl, layout, recording, streaming, video, sources, audio, camera}
 //                       {"type":"error","message":...,"request":<id of the refused request, if it had one>}
 //                       {"type":"offer","sdp":...,"sources":{"<mid>":"<stream id>",...}}  and ICE candidates
 //   viewer -> capture   select, command and configure requests (built below), the WebRTC answer and ICE candidates
@@ -11,6 +11,10 @@
 // devices ("input") and playback devices ("output", recorded as what they play), each with its id,
 // whether it is selected and how it is doing. "default-input" and "default-output" stand for
 // Windows' default devices and follow them when they change.
+//
+// The state's camera lists the cameras (devices), says which one is captured (selected: its id, or
+// null) and at what frame rate, separate from the screens'. The camera captured is one more of the
+// sources, with kind "camera", id "camera" and number 100.
 //
 // Media arrives in one of two ways, chosen by the capture client's video mode:
 //   h264  a WebRTC session offered by the capture client: one H.264 track per stream, G.711 audio
@@ -58,7 +62,7 @@ export function commandMessage(target, action) {
   return { type: 'command', target, action };
 }
 
-/** Changes settings: frameRate, videoMode, layout, audioDevices. */
+/** Changes settings: frameRate, cameraFrameRate, camera (a device id, or "none"), videoMode, layout, audioDevices. */
 export function configureMessage(settings) {
   return { type: 'configure', ...settings };
 }

@@ -56,7 +56,7 @@ internal sealed class StatusLine : IDisposable
             var current = new Dictionary<string, VideoStats>();
             foreach (VideoPipeline pipeline in _pipelines())
             {
-                string id = pipeline.Area.Id;
+                string id = pipeline.Id;
                 VideoStats stats = pipeline.GetStats();
                 current[id] = stats;
                 if (DescribeStream(id, stats, _lastStats.GetValueOrDefault(id), seconds) is { } line)

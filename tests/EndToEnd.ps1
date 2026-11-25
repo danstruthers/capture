@@ -165,6 +165,11 @@ function Set-Field([string]$id, [string]$value) {
     Get-Js "(() => { const field = document.getElementById('$id'); field.value = '$value'; field.dispatchEvent(new Event('change')); })()" | Out-Null
 }
 
+# Chooses an entry of a select element by its position, for values that are awkward to quote (camera ids).
+function Select-Option([string]$id, [int]$index) {
+    Get-Js "(() => { const field = document.getElementById('$id'); field.selectedIndex = $index; field.dispatchEvent(new Event('change')); })()" | Out-Null
+}
+
 # Ticks or unticks an audio device in the page's Audio devices list.
 function Switch-AudioDevice([string]$id) {
     Get-Js "[...document.querySelectorAll('#audio-devices input')].find(box => box.dataset.device === '$id').click()" | Out-Null
@@ -176,8 +181,8 @@ try {
     $config = Join-Path $work 'capture.json'
     Set-Content -Path $config -Value '{}'
 
-    Write-Host 'Options that name a screen or audio device that is not there'
-    foreach ($option in @(@('--screens', '64'), @('--audio-device', 'NoDeviceIsCalledThis'))) {
+    Write-Host 'Options that name a screen, camera or audio device that is not there'
+    foreach ($option in @(@('--screens', '64'), @('--audio-device', 'NoDeviceIsCalledThis'), @('--camera', 'NoCameraIsCalledThis'))) {
         $errors = Join-Path $work 'bad-option.err'
         $run = Start-Process -FilePath $captureExe -WorkingDirectory $work -PassThru -Wait -WindowStyle Hidden `
             -ArgumentList (@('--config', $config) + $option) -RedirectStandardOutput (Join-Path $work 'bad-option.log') -RedirectStandardError $errors
@@ -369,6 +374,43 @@ try {
         # The new streams take the screens over from the old ones rather than falling back to GDI.
         $fallbacks = @(Select-String -Path $captureLog -Pattern 'capturing it with GDI')
         Assert-That 'layout changes keep desktop duplication' ($fallbacks.Count -eq 0 -and (Get-Js "$state.sources.every(s => s.capture === 'DXGI desktop duplication')") -eq $true) (($fallbacks | ForEach-Object Line) -join '; ')
+    }
+
+    Write-Host 'The camera'
+    $cameras = [int](Get-Js "$state.camera.devices.length")
+    if ($cameras -gt 0) {
+        Assert-That 'the camera is off at first, and every camera can be chosen' ((Get-Js "$state.camera.selected === null && document.getElementById('camera').options.length === $cameras + 1") -eq $true)
+        Set-Field 'camera-rate' '15'
+        Assert-Eventually 'the camera has a frame rate of its own' "$state.camera.frameRate === 15 && $state.video.frameRate === 30"
+        Select-Option 'camera' 1
+        Assert-Eventually 'the camera becomes a stream of its own' "$state.camera.selected === $state.camera.devices[0].id && $state.sources.some(s => s.id === 'camera' && s.kind === 'camera')" 20
+        Assert-Eventually 'the camera has a tile and plays' "${stats}?.tiles?.includes('camera') && $stats.sources?.camera?.framesDecoded > 20" 40
+        Assert-That "the camera's video is H.264" ((Get-Js "$stats.sources.camera.codec") -like 'H.264*')
+        Assert-Eventually 'the camera arrives at about 15 fps' "$stats.sources.camera.framesPerSecond >= 11 && $stats.sources.camera.framesPerSecond <= 18" 30
+        Assert-That 'the screens keep their own frame rate' ((Get-Js "$state.sources.filter(s => s.kind !== 'camera').every(s => s.frameRate === 30) && $state.sources.find(s => s.kind === 'camera').frameRate === 15") -eq $true)
+        Assert-That 'the Camera section says how the camera runs' ((Get-Js "document.getElementById('camera-note').dataset.kind !== 'error' && document.getElementById('camera-note').textContent.includes('H.264')") -eq $true) (Get-Js "document.getElementById('camera-note').textContent")
+
+        Invoke-Click '#recording-start'
+        Assert-Eventually 'a recording includes the camera' "$state.recording.state === 'recording' && $state.recording.files.some(f => f.endsWith('-camera.mp4'))" 20
+        Start-Sleep -Seconds 3
+        Invoke-Click '#recording-stop'
+        Assert-Eventually 'recording stops' "$state.recording.state === 'stopped'"
+        $deadline = (Get-Date).AddSeconds(30)
+        while ((Get-Date) -lt $deadline -and -not (Select-String -Path $captureLog -CaseSensitive -Pattern 'Saved .*-camera\.mp4')) { Start-Sleep -Milliseconds 250 }
+        $cameraFile = Get-ChildItem $work -Filter '*-camera.mp4' | Select-Object -First 1
+        Assert-That 'an MP4 file was saved for the camera' ($cameraFile -and $cameraFile.Length -gt 20KB) "$($cameraFile.Name) $($cameraFile.Length) bytes"
+
+        Set-Field 'video-mode' 'jpeg'
+        Assert-Eventually 'the camera is shown as JPEG pictures too' "${stats}?.sources?.camera?.codec === 'JPEG' && $stats.sources.camera.framesDecoded > 10" 30
+        Set-Field 'video-mode' 'h264'
+
+        Select-Option 'camera' 0
+        Assert-Eventually 'switching the camera off removes its stream and its tile' "$state.camera.selected === null && !$state.sources.some(s => s.kind === 'camera') && !${stats}?.tiles?.includes('camera')" 20
+        Assert-Eventually 'the screens play on' "${stats}?.video?.codec?.startsWith('H.264') && $stats.tiles.length === $($sources.Count) && $stats.tiles.every(id => $stats.sources[id]?.framesDecoded > 20)" 30
+        Set-Field 'camera-rate' '30'
+    }
+    else {
+        Write-Skipped 'the camera checks: this machine has no camera'
     }
 
     Assert-That 'the page shows no control error' ((Get-Js "document.getElementById('control-note').dataset.kind") -ne 'error') (Get-Js "document.getElementById('control-note').textContent")

@@ -36,17 +36,17 @@ internal readonly record struct VideoStats(
     double JpegMs);
 
 /// <summary>
-/// One video stream: a capture area (a screen, or the whole desktop) → BGRX frame → H.264 and/or JPEG.
+/// One video stream: a frame source (a screen, the whole desktop or a camera) → BGRX frame → H.264 and/or JPEG.
 /// <para>
 /// One thread captures at the frame rate and hands each frame to whichever encoders are wanted at
 /// that moment; each encoder has its own thread, so a slow encode never delays the next screen
 /// grab. An encoder that cannot keep up drops frames rather than queueing them, which keeps the
-/// output live. When neither encoder is wanted the screen is not captured at all.
+/// output live. When neither encoder is wanted nothing is captured at all, and a camera is closed.
 /// </para>
 /// <para>
 /// Threads and what they own:
 /// <list type="bullet">
-/// <item>The capture thread reads the screen and queues frames.</item>
+/// <item>The capture thread reads the frame source and queues frames.</item>
 /// <item>The H.264 thread converts and encodes. It alone replaces the encoder (on a frame rate
 /// change or a hardware failure), so it alone writes <c>_encoder</c>, <c>_config</c> and
 /// <c>_encoderPreference</c>; other threads only read the current values.</item>
@@ -68,7 +68,7 @@ internal sealed unsafe class VideoPipeline : IDisposable
     private readonly VideoSettings _settings;
     private readonly MediaClock _clock;
     private readonly Func<H264EncoderConfig, EncoderPreference, H264Encoder> _createEncoder;
-    private readonly ScreenCapturer _capturer;
+    private readonly IFrameSource _capturer;
     private readonly VideoConverter _converter;
     private readonly BlockingCollection<(IMFSample Sample, long Timestamp)> _h264Queue = new(boundedCapacity: 2);
     private readonly ManualResetEventSlim _demand = new(false);
@@ -108,25 +108,24 @@ internal sealed unsafe class VideoPipeline : IDisposable
     private long _encodeTicks;
     private long _jpegTicks;
 
+    /// <param name="source">What to capture. The pipeline owns it from here on, and disposes it, even if this throws.</param>
     /// <param name="createEncoder">
     /// Makes the H.264 encoder for a configuration: <see cref="H264Encoders.Create"/>, unless a test
     /// puts a simulated hardware encoder here. The software encoder that takes over from a failed
     /// hardware encoder is always the real one.
     /// </param>
-    public VideoPipeline(CaptureArea area, VideoSettings settings, MediaClock clock, Func<H264EncoderConfig, EncoderPreference, H264Encoder>? createEncoder = null)
+    public VideoPipeline(IFrameSource source, VideoSettings settings, MediaClock clock, Func<H264EncoderConfig, EncoderPreference, H264Encoder>? createEncoder = null)
     {
         _settings = settings;
         _clock = clock;
         _createEncoder = createEncoder ?? H264Encoders.Create;
-        Area = area;
-
-        (_width, _height) = ChooseOutputSize(area, settings);
-        _config = CreateConfig(settings.Fps);
+        _capturer = source;
         _frameRate = settings.Fps;
 
-        _capturer = new ScreenCapturer(area, settings.DrawCursor, settings.CaptureMethod);
         try
         {
+            (_width, _height) = ChooseOutputSize(source.Width, source.Height, source.Name, settings);
+            _config = CreateConfig(settings.Fps);
             _converter = VideoConverter.ToNv12(_capturer.Width, _capturer.Height, _width, _height, _config.Bt709);
             try
             {
@@ -146,9 +145,9 @@ internal sealed unsafe class VideoPipeline : IDisposable
             throw;
         }
 
-        _captureThread = NewThread(CaptureLoop, $"{area.Id}-capture");
-        _h264Thread = NewThread(H264Loop, $"{area.Id}-h264");
-        _jpegThread = NewThread(JpegLoop, $"{area.Id}-jpeg");
+        _captureThread = NewThread(CaptureLoop, $"{source.Id}-capture");
+        _h264Thread = NewThread(H264Loop, $"{source.Id}-h264");
+        _jpegThread = NewThread(JpegLoop, $"{source.Id}-jpeg");
     }
 
     /// <summary>Raised for every H.264 frame, in order.</summary>
@@ -160,9 +159,15 @@ internal sealed unsafe class VideoPipeline : IDisposable
     /// <summary>Raised once if the pipeline stops because of an unrecoverable error.</summary>
     public event Action<Exception>? Faulted;
 
-    public CaptureArea Area { get; }
+    /// <summary>The stream id: "screen1", "desktop", "camera".</summary>
+    public string Id => _capturer.Id;
 
-    /// <summary>Whether anything is using this stream, so that the screen is being captured.</summary>
+    public string Name => _capturer.Name;
+
+    /// <summary>What the pictures come from.</summary>
+    public IFrameSource Source => _capturer;
+
+    /// <summary>Whether anything is using this stream, so that it is being captured.</summary>
     public bool IsCapturing => _wantH264 || _wantJpeg;
 
     /// <summary>The configuration of the H.264 stream being produced.</summary>
@@ -204,6 +209,7 @@ internal sealed unsafe class VideoPipeline : IDisposable
 
         try
         {
+            _capturer.SetActive(h264 || jpeg);
             if (h264 || jpeg)
             {
                 _demand.Set();
@@ -287,31 +293,35 @@ internal sealed unsafe class VideoPipeline : IDisposable
     }
 
     /// <summary>
-    /// The video size: the area's own size, scaled down (never up, keeping the shape) to fit within
-    /// the configured maximums and within what H.264 encoders accept.
+    /// The video size: the picture's own size, scaled down (never up, keeping the shape) to fit
+    /// within the configured maximums and within what H.264 encoders accept.
     /// </summary>
-    internal static (int Width, int Height) ChooseOutputSize(CaptureArea area, VideoSettings settings)
+    internal static (int Width, int Height) ChooseOutputSize(int width, int height, string name, VideoSettings settings)
     {
         double scale = 1;
         if (settings.MaxWidth is { } maxWidth)
         {
-            scale = Math.Min(scale, maxWidth / (double)area.Width);
+            scale = Math.Min(scale, maxWidth / (double)width);
         }
 
         if (settings.MaxHeight is { } maxHeight)
         {
-            scale = Math.Min(scale, maxHeight / (double)area.Height);
+            scale = Math.Min(scale, maxHeight / (double)height);
         }
 
-        double encoderLimit = Math.Min(MaxEncodeWidth / (double)area.Width, MaxEncodeHeight / (double)area.Height);
+        double encoderLimit = Math.Min(MaxEncodeWidth / (double)width, MaxEncodeHeight / (double)height);
         if (encoderLimit < scale)
         {
             scale = encoderLimit;
-            Log.Info($"{area.Name} is larger than H.264 encoders accept; its video is scaled to {ToEven(area.Width * scale)}x{ToEven(area.Height * scale)}.");
+            Log.Info($"{name} is larger than H.264 encoders accept; its video is scaled to {ToEven(width * scale)}x{ToEven(height * scale)}.");
         }
 
-        return (ToEven(area.Width * scale), ToEven(area.Height * scale));
+        return (ToEven(width * scale), ToEven(height * scale));
     }
+
+    /// <summary>The largest video the settings allow: their maximums, within what H.264 encoders accept (see <see cref="ChooseOutputSize"/>).</summary>
+    internal static (int Width, int Height) MaxOutputSize(VideoSettings settings) =>
+        (Math.Min(settings.MaxWidth ?? int.MaxValue, MaxEncodeWidth), Math.Min(settings.MaxHeight ?? int.MaxValue, MaxEncodeHeight));
 
     /// <summary>4:2:0 video needs even dimensions.</summary>
     private static int ToEven(double value) => Math.Max(64, (int)Math.Round(value) & ~1);
@@ -331,7 +341,7 @@ internal sealed unsafe class VideoPipeline : IDisposable
         try
         {
             long next = _clock.Now;
-            bool desktopUnavailable = false;
+            bool unavailable = false;
 
             while (!_stopping)
             {
@@ -339,7 +349,7 @@ internal sealed unsafe class VideoPipeline : IDisposable
                 bool wantJpeg = _wantJpeg;
                 if (!wantH264 && !wantJpeg)
                 {
-                    // Nobody is recording or watching: leave the screen alone until someone is.
+                    // Nobody is recording or watching: leave the source alone until someone is.
                     _demand.Wait();
                     next = _clock.Now;
                     continue;
@@ -363,21 +373,29 @@ internal sealed unsafe class VideoPipeline : IDisposable
                 }
 
                 long started = Stopwatch.GetTimestamp();
-                bool captured = _capturer.Capture(out int error);
-                if (captured != !desktopUnavailable)
+                bool captured = _capturer.Capture(out string? problem);
+                bool hasPicture = _capturer.HasPicture;
+                if (captured != !unavailable)
                 {
-                    desktopUnavailable = !captured;
-                    if (desktopUnavailable)
+                    unavailable = !captured;
+                    if (unavailable)
                     {
-                        Log.Warn($"{Area.Name} cannot be captured right now ({ScreenCapturer.DescribeError(error)}); repeating the last frame until it can.");
+                        Log.Warn($"{Name} cannot be captured right now ({problem}); {(hasPicture ? "repeating the last frame" : "waiting")} until it can.");
                     }
                     else
                     {
-                        Log.Info($"{Area.Name} is being captured again.");
+                        Log.Info($"{Name} is being captured again.");
                     }
                 }
 
                 long interval = MediaClock.TicksPerSecond / _frameRate;
+                if (!hasPicture)
+                {
+                    // A camera that is still starting: nothing to send yet, not even black.
+                    Interlocked.Add(ref _captureTicks, Stopwatch.GetTimestamp() - started);
+                    next = now + interval;
+                    continue;
+                }
 
                 if (wantH264)
                 {
@@ -478,7 +496,7 @@ internal sealed unsafe class VideoPipeline : IDisposable
 
         _config = pending;
         UseEncoder(replacement);
-        Log.Debug($"{Area.Name}: {pending.Fps} fps, {pending.BitrateBps / 1000} kbit/s, {replacement.Name}.");
+        Log.Debug($"{Name}: {pending.Fps} fps, {pending.BitrateBps / 1000} kbit/s, {replacement.Name}.");
     }
 
     /// <summary>
@@ -516,7 +534,7 @@ internal sealed unsafe class VideoPipeline : IDisposable
         }
         catch (Exception ex) when (_encoder.IsHardware && _settings.Encoder == EncoderPreference.Auto)
         {
-            Log.Warn($"{Area.Name}: hardware encoder '{_encoder.Name}' failed ({ex.Message}); switching to the software encoder.");
+            Log.Warn($"{Name}: hardware encoder '{_encoder.Name}' failed ({ex.Message}); switching to the software encoder.");
 
             // A failed encoder has nothing worth draining.
             RetireEncoder(drain: false);

@@ -40,7 +40,7 @@ public class CaptureAreaTests
     [Fact]
     public void Video_keeps_the_screen_size_when_it_fits()
     {
-        Assert.Equal((2560, 1440), VideoPipeline.ChooseOutputSize(CaptureArea.ForScreen(Primary), Settings()));
+        Assert.Equal((2560, 1440), OutputSize(CaptureArea.ForScreen(Primary), Settings()));
     }
 
     [Fact]
@@ -48,7 +48,7 @@ public class CaptureAreaTests
     {
         CaptureArea desktop = CaptureArea.ForDesktop([Primary, Left]);
 
-        (int width, int height) = VideoPipeline.ChooseOutputSize(desktop, Settings());
+        (int width, int height) = OutputSize(desktop, Settings());
 
         Assert.Equal(4096, width);
         Assert.Equal(1316, height); // 1440 * 4096 / 4480, made even
@@ -61,6 +61,9 @@ public class CaptureAreaTests
     [InlineData(5000, 3000, 2560, 1440)] // never scaled up
     public void Maximum_sizes_scale_the_video_down_keeping_its_shape(int? maxWidth, int? maxHeight, int width, int height)
     {
-        Assert.Equal((width, height), VideoPipeline.ChooseOutputSize(CaptureArea.ForScreen(Primary), Settings(maxWidth, maxHeight)));
+        Assert.Equal((width, height), OutputSize(CaptureArea.ForScreen(Primary), Settings(maxWidth, maxHeight)));
     }
+
+    private static (int Width, int Height) OutputSize(CaptureArea area, VideoSettings settings) =>
+        VideoPipeline.ChooseOutputSize(area.Width, area.Height, area.Name, settings);
 }

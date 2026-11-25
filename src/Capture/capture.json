@@ -12,6 +12,14 @@
   // Frames per second (1-60). Lower rates use less CPU; viewers can change it while running.
   // "fps": 30,
 
+  // A camera to capture as well, as a stream of its own: its number or part of its name (see
+  // "capture --list-devices"), or "none" (or false) for none. No camera unless one is named;
+  // viewers can switch it on or off.
+  // "camera": "1",
+
+  // The camera's frames per second (1-60), separate from the screens'.
+  // "cameraFps": 30,
+
   // How viewers get video: "h264" (WebRTC) or "jpeg" (pictures over the WebSocket).
   // "videoMode": "h264",
 

@@ -44,6 +44,25 @@ public sealed class OptionsTests : IDisposable
     }
 
     [Fact]
+    public void The_camera_is_off_unless_named_and_has_its_own_frame_rate()
+    {
+        Assert.Null(Load().CameraSelector);
+        Assert.Equal(30, Load().CameraFps);
+
+        Options options = Load("--camera", "Live Camera", "--camera-fps", "15", "--fps", "10");
+        Assert.Equal("Live Camera", options.CameraSelector);
+        Assert.Equal(15, options.CameraFps);
+        Assert.Equal(10, options.Fps);
+
+        // The command line can switch off a camera the configuration file names.
+        Assert.Null(Options.Load(["--config", Config("""{ "camera": "1" }"""), "--camera", "none"]).CameraSelector);
+
+        // In the file, false means no camera, as it does in a viewer's request.
+        Assert.Null(Options.Load(["--config", Config("""{ "camera": false }""")]).CameraSelector);
+        Assert.Throws<ArgumentException>(() => Load("--camera-fps", "61"));
+    }
+
+    [Fact]
     public void The_output_folder_can_use_environment_variables_and_is_made_a_full_path()
     {
         string config = Config("""{ "outputDir": "%TEMP%\\recordings\\" }""");

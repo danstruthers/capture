@@ -43,6 +43,9 @@ public sealed class ViewerProtocolTests
     [InlineData("""{"audioSource":"everything"}""", "audio source")]
     [InlineData("""{"audioDevices":"default-input"}""", "audioDevices")]
     [InlineData("""{"audioDevices":[1]}""", "audioDevices")]
+    [InlineData("""{"cameraFrameRate":0}""", "camera's frame rate")]
+    [InlineData("""{"camera":""}""", "camera")]
+    [InlineData("""{"camera":1}""", "camera")]
     [InlineData("""{"frameRate":15,"volume":3}""", "'volume'")]
     public void A_setting_that_is_not_valid_is_refused_saying_what_is_wrong(string json, string expected)
     {
@@ -81,20 +84,21 @@ public sealed class ViewerProtocolTests
             Recording: new RecordingInfo(RecordingState.Paused, ["a.mp4"], 1.5, 2048),
             Streaming: new StreamingInfo(StreamingState.Streaming, 1, 2),
             Video: new VideoInfo(VideoMode.H264, 30, 60),
-            Sources: [new SourceInfo("screen1", 1, "Screen 1", [1], true, 0, 0, 2560, 1440, 2560, 1440, 7741, true, 1, "GDI", "Microsoft H264 Encoder MFT", false)],
+            Sources: [new SourceInfo("screen1", 1, SourceKind.Screen, "Screen 1", [1], true, 0, 0, 2560, 1440, 2560, 1440, 30, 7741, true, 1, "GDI", "Microsoft H264 Encoder MFT", false)],
             Audio: new AudioInfo(true, "microphone", ["default-input"], "Microphone", 8000,
-                [new AudioDeviceEntry("default-input", AudioDeviceKind.Input, "Default recording device", "Microphone", false, true, true, AudioDeviceStatus.Capturing, null, "48000 Hz, 1 ch")]));
+                [new AudioDeviceEntry("default-input", AudioDeviceKind.Input, "Default recording device", "Microphone", false, true, true, AudioDeviceStatus.Capturing, null, "48000 Hz, 1 ch")]),
+            Camera: new CameraState(@"\\?\usb#cam", 30, "NV12 1920x1080 at 30 fps", null, [new CameraEntry(@"\\?\usb#cam", "USB Live Camera", true)]));
 
         JsonElement json = Json(ViewerProtocol.Serialize(state));
 
-        Assert.Equal(["type", "remoteControl", "layout", "recording", "streaming", "video", "sources", "audio"], json.EnumerateObject().Select(p => p.Name));
+        Assert.Equal(["type", "remoteControl", "layout", "recording", "streaming", "video", "sources", "audio", "camera"], json.EnumerateObject().Select(p => p.Name));
         Assert.Equal("state", json.GetProperty("type").GetString());
         Assert.Equal("separate", json.GetProperty("layout").GetString());
         Assert.Equal("paused", json.GetProperty("recording").GetProperty("state").GetString());
         Assert.Equal("streaming", json.GetProperty("streaming").GetProperty("state").GetString());
         Assert.Equal("h264", json.GetProperty("video").GetProperty("mode").GetString());
         Assert.Equal(
-            ["bitrateKbps", "capture", "capturing", "encoder", "hardware", "height", "id", "left", "name", "number", "primary", "screens", "top", "videoHeight", "videoWidth", "viewers", "width"],
+            ["bitrateKbps", "capture", "capturing", "encoder", "frameRate", "hardware", "height", "id", "kind", "left", "name", "number", "primary", "screens", "top", "videoHeight", "videoWidth", "viewers", "width"],
             json.GetProperty("sources")[0].EnumerateObject().Select(p => p.Name).Order());
 
         JsonElement audio = json.GetProperty("audio");
@@ -103,6 +107,24 @@ public sealed class ViewerProtocolTests
         Assert.Equal(["default", "device", "format", "id", "kind", "name", "present", "problem", "selected", "status"], device.EnumerateObject().Select(p => p.Name).Order());
         Assert.Equal("input", device.GetProperty("kind").GetString());
         Assert.Equal("capturing", device.GetProperty("status").GetString());
+        Assert.Equal("screen", json.GetProperty("sources")[0].GetProperty("kind").GetString());
+
+        JsonElement camera = json.GetProperty("camera");
+        Assert.Equal(["devices", "frameRate", "mode", "problem", "selected"], camera.EnumerateObject().Select(p => p.Name).Order());
+        Assert.Equal(["id", "name", "selected"], camera.GetProperty("devices")[0].EnumerateObject().Select(p => p.Name).Order());
+    }
+
+    [Fact]
+    public void A_configure_request_chooses_the_camera_and_its_frame_rate()
+    {
+        ConfigureRequest request = ConfigureRequest.Parse(Json("""{"camera":"\\\\?\\usb#cam","cameraFrameRate":15}"""));
+        Assert.Equal(@"\\?\usb#cam", request.Camera);
+        Assert.Equal(15, request.CameraFrameRate);
+        Assert.False(request.IsEmpty);
+
+        Assert.Equal(ConfigureRequest.NoCamera, ConfigureRequest.Parse(Json("""{"camera":"none"}""")).Camera);
+        Assert.Equal(ConfigureRequest.NoCamera, ConfigureRequest.Parse(Json("""{"camera":false}""")).Camera);
+        Assert.Equal(ConfigureRequest.NoCamera, ConfigureRequest.Parse(Json("""{"camera":null}""")).Camera);
     }
 
     [Fact]

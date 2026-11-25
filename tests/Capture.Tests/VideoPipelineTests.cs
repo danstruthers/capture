@@ -71,7 +71,7 @@ public sealed class VideoPipelineTests
             CaptureMethod.Gdi,
             JpegQuality: 70);
 
-        var pipeline = new VideoPipeline(CaptureArea.ForScreen(screen), settings, new MediaClock(), createEncoder);
+        var pipeline = new VideoPipeline(new ScreenCapturer(CaptureArea.ForScreen(screen), settings.DrawCursor, settings.CaptureMethod), settings, new MediaClock(), createEncoder);
         pipeline.FrameEncoded += frames.Add;
         pipeline.Start();
         pipeline.SetDemand(h264: true, jpeg: false);

@@ -22,6 +22,9 @@ public enum Needs
 
     /// <summary>At least one audio device, recording or playback.</summary>
     AudioDevices = 16,
+
+    /// <summary>A camera.</summary>
+    Camera = 32,
 }
 
 /// <summary>A test that is skipped, saying why, on a machine without what it <see cref="Needs"/>.</summary>
@@ -82,7 +85,29 @@ internal static class Machine
         }
     });
 
+    private static readonly Lazy<IReadOnlyList<CameraDevice>> s_cameras = new(() =>
+    {
+        try
+        {
+            Mf.Startup();
+            try
+            {
+                return CameraDevices.Enumerate();
+            }
+            finally
+            {
+                Mf.Shutdown();
+            }
+        }
+        catch (Exception)
+        {
+            return [];
+        }
+    });
+
     public static IReadOnlyList<DisplayInfo> Displays => s_displays.Value;
+
+    public static IReadOnlyList<CameraDevice> Cameras => s_cameras.Value;
 
     /// <summary>Why this machine cannot run a test that needs <paramref name="needs"/>, or null if it can.</summary>
     public static string? Lacks(Needs needs)
@@ -110,6 +135,11 @@ internal static class Machine
         if (needs.HasFlag(Needs.AudioDevices) && !s_audioDevices.Value)
         {
             return "needs an audio device";
+        }
+
+        if (needs.HasFlag(Needs.Camera) && Cameras.Count == 0)
+        {
+            return "needs a camera";
         }
 
         return null;

@@ -54,25 +54,27 @@ internal static class Program
                 return 0;
             }
 
-            // Looked up before anything starts, so that naming a screen or audio device that is not
-            // there is reported like any other mistake in the options.
+            // Looked up before anything starts, so that naming a screen, camera or audio device that
+            // is not there is reported like any other mistake in the options.
             IReadOnlyList<DisplayInfo> screens;
             string[] audioSelection;
+            CameraDevice? camera;
             try
             {
                 screens = DisplayInfo.Select(options.Screens);
                 audioSelection = options.Audio
                     ? AudioSelection.FromOptions(options.AudioSource, options.AudioDeviceSelectors.Select(AudioDevices.Find))
                     : [];
+                camera = options.CameraSelector is { } selector ? CameraDevices.Find(selector) : null;
             }
             catch (ArgumentException ex)
             {
                 Console.Error.WriteLine($"capture: {ex.Message}");
-                Console.Error.WriteLine("Run 'capture --list-devices' to see the screens and audio devices.");
+                Console.Error.WriteLine("Run 'capture --list-devices' to see the screens, cameras and audio devices.");
                 return 2;
             }
 
-            return Run(options, screens, audioSelection);
+            return Run(options, screens, audioSelection, camera);
         }
         catch (Exception ex)
         {
@@ -86,7 +88,7 @@ internal static class Program
         }
     }
 
-    private static int Run(Options options, IReadOnlyList<DisplayInfo> screens, string[] audioSelection)
+    private static int Run(Options options, IReadOnlyList<DisplayInfo> screens, string[] audioSelection, CameraDevice? camera)
     {
         using var stopRequested = new ManualResetEventSlim(false);
         using var finished = new ManualResetEventSlim(false);
@@ -115,7 +117,7 @@ internal static class Program
 
         try
         {
-            using var session = new CaptureSession(options, screens, audioSelection);
+            using var session = new CaptureSession(options, screens, audioSelection, camera);
             session.Faulted += _ => stopRequested.Set();
             session.Start();
 
@@ -150,6 +152,19 @@ internal static class Program
         {
             string primary = display.IsPrimary ? "  [primary]" : string.Empty;
             Console.WriteLine($"  {display.Number}: {display.DeviceName}  {display.Width}x{display.Height} at ({display.Left},{display.Top}){primary}");
+        }
+
+        Console.WriteLine();
+        Console.WriteLine("Cameras (--camera):");
+        IReadOnlyList<CameraDevice> cameras = CameraDevices.Enumerate();
+        if (cameras.Count == 0)
+        {
+            Console.WriteLine("  (none)");
+        }
+
+        foreach (CameraDevice camera in cameras)
+        {
+            Console.WriteLine($"  {camera.Number}: {camera.Name}");
         }
 
         Console.WriteLine();

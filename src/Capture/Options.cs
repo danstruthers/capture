@@ -73,6 +73,13 @@ internal sealed class Options
                 (o, name, value) => o.Capture = ParseEnum<CaptureMethod>(name, value)),
             Switch("--cursor", "Leave the mouse pointer out of the video", (o, on) => o.DrawCursor = on, shownOff: true),
         ]),
+        ("Camera",
+        [
+            Value("--camera", "<camera>", "Also capture this camera, as a stream of its own: a number from --list-devices or part of its name; none for no camera (default). Viewers can switch it on or off and choose another.",
+                (o, name, value) => o.CameraSelector = ParseCamera(name, value)),
+            Value("--camera-fps", "<n>", $"The camera's frames per second, {VideoSettings.MinFps}-{VideoSettings.MaxFps}, separate from the screens' (default: 30). Viewers can change it.",
+                (o, name, value) => o.CameraFps = ParseInt(name, value, VideoSettings.MinFps, VideoSettings.MaxFps)),
+        ]),
         ("Audio",
         [
             Value("--audio-source", "<src>", "microphone, desktop (what the PC is playing), both or none (default: microphone): Windows' default recording and playback devices. Viewers can choose any devices.",
@@ -114,7 +121,7 @@ internal sealed class Options
                 (o, name, value) => o.DurationSeconds = ParseDouble(name, value, 0.1, 31_536_000)),
             Value("--stats", "<seconds>", "Status line interval; 0 turns it off (default: 5)",
                 (o, name, value) => o.StatsSeconds = ParseDouble(name, value, 0, 3600)),
-            Switch("--list-devices", "List screens, audio devices and H.264 encoders", (o, on) => o.ListDevices = on, commandLineOnly: true),
+            Switch("--list-devices", "List screens, cameras, audio devices and H.264 encoders", (o, on) => o.ListDevices = on, commandLineOnly: true),
             Switch("-v|--verbose", "Detailed logging", (o, on) => o.Verbose = on),
             Switch("-h|--help|-?|/?", "Show this help", (o, on) => o.Help = on, commandLineOnly: true),
         ]),
@@ -155,6 +162,11 @@ internal sealed class Options
     public CaptureMethod Capture { get; private set; } = CaptureMethod.Auto;
 
     public bool DrawCursor { get; private set; } = true;
+
+    /// <summary>The camera to capture (--camera), as given: a number or part of a name; null for none. Looked up when capture starts.</summary>
+    public string? CameraSelector { get; private set; }
+
+    public int CameraFps { get; private set; } = 30;
 
     public AudioSourceKind AudioSource { get; private set; } = AudioSourceKind.Microphone;
 
@@ -253,6 +265,11 @@ internal sealed class Options
                 {
                     case JsonValueKind.True:
                         arguments.Add($"--{option}");
+                        break;
+                    case JsonValueKind.False when known.Option is { Kind: not OptionKind.Switch }:
+                        // An option with a value, such as "camera": false; the option says whether false means anything to it.
+                        arguments.Add($"--{option}");
+                        arguments.Add("false");
                         break;
                     case JsonValueKind.False:
                         arguments.Add(option.StartsWith("no-", StringComparison.Ordinal) ? $"--{option[3..]}" : $"--no-{option}");
@@ -442,6 +459,16 @@ internal sealed class Options
         "system" or "loopback" => AudioSourceKind.Desktop,
         _ => ParseEnum<AudioSourceKind>(name, text),
     };
+
+    /// <summary>
+    /// A camera's number or name; "none" (or "off", or false in the configuration file) for no
+    /// camera, so that the command line can undo the configuration file.
+    /// </summary>
+    private static string? ParseCamera(string name, string text)
+    {
+        string camera = ParseText(name, text);
+        return camera.ToLowerInvariant() is "none" or "off" or "false" ? null : camera;
+    }
 
     private static IPAddress ParseAddress(string name, string text)
     {

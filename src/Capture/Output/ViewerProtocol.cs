@@ -95,7 +95,8 @@ internal sealed record StateMessage(
     StreamingInfo Streaming,
     VideoInfo Video,
     IReadOnlyList<SourceInfo> Sources,
-    AudioInfo Audio)
+    AudioInfo Audio,
+    CameraState Camera)
 {
     [JsonPropertyOrder(-1)]
     public string Type => "state";
@@ -111,19 +112,29 @@ internal sealed record StreamingInfo(StreamingState State, int Viewers, int Clie
 
 internal sealed record VideoInfo(VideoMode Mode, int FrameRate, int JpegQuality);
 
-/// <summary>One video stream: a screen, or the whole desktop.</summary>
-/// <param name="Id">"screen1", "screen2", ... or "desktop".</param>
-/// <param name="Number">Identifies the stream in binary messages: the screen number, or 0 for the desktop.</param>
-/// <param name="Screens">The numbers of the screens it shows.</param>
-/// <param name="Left">Position and size on the desktop, in pixels.</param>
+internal enum SourceKind
+{
+    Screen,
+    Desktop,
+    Camera,
+}
+
+/// <summary>One video stream: a screen, the whole desktop, or the camera.</summary>
+/// <param name="Id">"screen1", "screen2", ..., "desktop" or "camera".</param>
+/// <param name="Number">Identifies the stream in binary messages: the screen number, 0 for the desktop, 100 for the camera.</param>
+/// <param name="Name">"Screen 1", "Desktop", or the camera's name.</param>
+/// <param name="Screens">The numbers of the screens it shows (none for the camera).</param>
+/// <param name="Left">Position and size on the desktop, in pixels; for the camera, 0, 0 and its picture size.</param>
 /// <param name="VideoWidth">The encoded size (smaller when scaled down).</param>
+/// <param name="FrameRate">The frame rate it is captured and encoded at.</param>
 /// <param name="Capturing">Whether anything uses it, so that it is being captured.</param>
 /// <param name="Viewers">Clients receiving it.</param>
-/// <param name="Capture">How the screen is read: "DXGI desktop duplication" or "GDI".</param>
+/// <param name="Capture">How it is read: "DXGI desktop duplication", "GDI", or "camera, NV12 1920x1080 at 30 fps".</param>
 /// <param name="Hardware">Whether the encoder is a hardware one.</param>
 internal sealed record SourceInfo(
     string Id,
     int Number,
+    SourceKind Kind,
     string Name,
     IReadOnlyList<int> Screens,
     bool Primary,
@@ -133,6 +144,7 @@ internal sealed record SourceInfo(
     int Height,
     int VideoWidth,
     int VideoHeight,
+    int FrameRate,
     int BitrateKbps,
     bool Capturing,
     int Viewers,
@@ -147,6 +159,16 @@ internal sealed record AudioInfo(bool Enabled, string Source, IReadOnlyList<stri
 {
     public static AudioInfo Off { get; } = new(false, "none", [], null, PcmFormat.SampleRate, []);
 }
+
+/// <summary>The camera: which one is captured, if any, and which ones there are.</summary>
+/// <param name="Selected">The id of the camera being captured; null when none is.</param>
+/// <param name="FrameRate">The camera's frame rate, separate from the screens'.</param>
+/// <param name="Mode">How the camera runs, for display: "NV12 1920x1080 at 30 fps".</param>
+/// <param name="Problem">Why the camera is not delivering pictures, or why the last one asked for could not be used.</param>
+internal sealed record CameraState(string? Selected, int FrameRate, string? Mode, string? Problem, IReadOnlyList<CameraEntry> Devices);
+
+/// <param name="Id">What to send as "camera" in a configure request to capture it.</param>
+internal sealed record CameraEntry(string Id, string Name, bool Selected);
 
 internal enum AudioDeviceStatus
 {
@@ -254,7 +276,16 @@ internal sealed record CommandRequest(CommandTarget Target, CommandAction Action
 /// </summary>
 internal sealed record ConfigureRequest
 {
+    /// <summary>The value of <see cref="Camera"/> that switches the camera off.</summary>
+    public const string NoCamera = "none";
+
+    /// <summary>The screens' frame rate.</summary>
     public int? FrameRate { get; init; }
+
+    /// <summary>The id of the camera to capture (from the state's camera.devices), or <see cref="NoCamera"/>.</summary>
+    public string? Camera { get; init; }
+
+    public int? CameraFrameRate { get; init; }
 
     public VideoMode? VideoMode { get; init; }
 
@@ -263,7 +294,7 @@ internal sealed record ConfigureRequest
     /// <summary>Exactly the audio entries to record.</summary>
     public IReadOnlyList<string>? AudioDevices { get; init; }
 
-    public bool IsEmpty => FrameRate is null && VideoMode is null && Layout is null && AudioDevices is null;
+    public bool IsEmpty => FrameRate is null && Camera is null && CameraFrameRate is null && VideoMode is null && Layout is null && AudioDevices is null;
 
     /// <summary>
     /// Reads and checks every setting; throws <see cref="RefusedException"/>, saying what is wrong,
@@ -278,11 +309,14 @@ internal sealed record ConfigureRequest
             request = setting.Name switch
             {
                 "type" or "id" => request, // the message's envelope, not settings
-                "frameRate" => request with
+                "frameRate" => request with { FrameRate = FrameRateOf(value, "The frame rate") },
+                "cameraFrameRate" => request with { CameraFrameRate = FrameRateOf(value, "The camera's frame rate") },
+                "camera" => request with
                 {
-                    FrameRate = value.ValueKind == JsonValueKind.Number && value.TryGetInt32(out int fps) && fps is >= VideoSettings.MinFps and <= VideoSettings.MaxFps
-                        ? fps
-                        : throw new RefusedException($"The frame rate has to be a whole number from {VideoSettings.MinFps} to {VideoSettings.MaxFps}."),
+                    // An id, or "none" (also false or null) for no camera.
+                    Camera = value.ValueKind is JsonValueKind.False or JsonValueKind.Null ? NoCamera
+                        : Text(value) is { Length: > 0 } id ? id
+                        : throw new RefusedException("camera has to be the id of one of the state's camera.devices, or \"none\"."),
                 },
                 "videoMode" => request with
                 {
@@ -311,4 +345,9 @@ internal sealed record ConfigureRequest
     }
 
     private static string? Text(JsonElement value) => value.ValueKind == JsonValueKind.String ? value.GetString() : null;
+
+    private static int FrameRateOf(JsonElement value, string what) =>
+        value.ValueKind == JsonValueKind.Number && value.TryGetInt32(out int fps) && fps is >= VideoSettings.MinFps and <= VideoSettings.MaxFps
+            ? fps
+            : throw new RefusedException($"{what} has to be a whole number from {VideoSettings.MinFps} to {VideoSettings.MaxFps}.");
 }

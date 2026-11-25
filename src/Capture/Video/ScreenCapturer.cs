@@ -23,7 +23,7 @@ internal enum CaptureMethod
 /// screen: slower, but it works everywhere.
 /// </para>
 /// </summary>
-internal sealed class ScreenCapturer : IDisposable
+internal sealed class ScreenCapturer : IFrameSource
 {
     private static readonly long RetryInterval = Stopwatch.Frequency; // one second
 
@@ -105,6 +105,12 @@ internal sealed class ScreenCapturer : IDisposable
         }
     }
 
+    public CaptureArea Area => _area;
+
+    public string Id => _area.Id;
+
+    public string Name => _area.Name;
+
     public int Width { get; }
 
     public int Height { get; }
@@ -115,6 +121,9 @@ internal sealed class ScreenCapturer : IDisposable
 
     /// <summary>The captured pixels: top-down BGRX, <see cref="Stride"/> bytes per row.</summary>
     public IntPtr Pixels { get; }
+
+    /// <summary>A screen always has a picture to send, even if only the last one before the lock screen.</summary>
+    public bool HasPicture => true;
 
     public string Method
     {
@@ -176,6 +185,18 @@ internal sealed class ScreenCapturer : IDisposable
         // GDI batches drawing calls; flush before the pixels are read directly.
         NativeMethods.GdiFlush();
         return captured;
+    }
+
+    bool IFrameSource.Capture(out string? problem)
+    {
+        bool captured = Capture(out int errorCode);
+        problem = captured ? null : DescribeError(errorCode);
+        return captured;
+    }
+
+    /// <summary>Screens need nothing opened or closed: a capture that is not asked for does nothing.</summary>
+    public void SetActive(bool active)
+    {
     }
 
     public static string DescribeError(int errorCode) => new Win32Exception(errorCode).Message;

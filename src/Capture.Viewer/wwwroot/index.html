@@ -82,7 +82,7 @@
             <option value="jpeg">JPEG pictures</option>
           </select>
 
-          <label for="frame-rate">Frame rate</label>
+          <label for="frame-rate">Screen frame rate</label>
           <span class="with-unit">
             <input id="frame-rate" type="number" min="1" max="60" step="1" inputmode="numeric" list="frame-rates" disabled>
             <span>fps</span>
@@ -95,6 +95,23 @@
             <option value="30"></option>
             <option value="60"></option>
           </datalist>
+        </div>
+      </section>
+
+      <section id="camera-section" aria-labelledby="camera-title">
+        <h2 id="camera-title">Camera</h2>
+        <p id="camera-note" class="note" role="status">Connect to see the cameras.</p>
+        <div class="settings">
+          <label for="camera">Capture</label>
+          <select id="camera" disabled>
+            <option value="none">Off</option>
+          </select>
+
+          <label for="camera-rate">Frame rate</label>
+          <span class="with-unit">
+            <input id="camera-rate" type="number" min="1" max="60" step="1" inputmode="numeric" list="frame-rates" disabled>
+            <span>fps</span>
+          </span>
         </div>
       </section>
 

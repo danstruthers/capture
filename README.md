@@ -1,10 +1,12 @@
 # Capture
 
-A Windows console application that captures the screens and audio, records them to MP4 and
-streams them to viewers, plus a single-page web viewer for testing and remote control.
+A Windows console application that captures the screens, a camera and audio, records them to MP4
+and streams them to viewers, plus a single-page web viewer for testing and remote control.
 
 - **Screens**: each screen as its own stream, or the whole desktop (every screen, arranged as on
   the desktop) as one stream.
+- **Camera**: any camera connected to the PC can be captured as well, as a stream of its own, at
+  a frame rate of its own (30 fps unless you choose another).
 - **Video**: H.264, encoded once per stream and used for both the MP4 files and the live stream.
   A hardware encoder is used when the machine has a working one; otherwise the Microsoft software
   encoder.
@@ -14,10 +16,11 @@ streams them to viewers, plus a single-page web viewer for testing and remote co
   WebRTC, or as the PCM itself over the WebSocket.
 - **Streaming**: WebRTC (H.264 + G.711), or as a fallback JPEG pictures and raw PCM over a WebSocket.
 - **Remote control**: viewers can start, stop, pause and resume recording and streaming, change the
-  frame rate, switch the screen layout and the video method, and see every audio device and choose
-  which ones are recorded.
-- **Viewer**: shows each screen in its own tile; you choose which screens to watch, zoom each one
-  with the mouse wheel, and pop any of them out into a window of its own.
+  frame rate, switch the screen layout and the video method, switch the camera on or off, choose
+  which camera and set its frame rate, and see every audio device and choose which ones are
+  recorded.
+- **Viewer**: shows each screen, and the camera, in its own tile; you choose which ones to watch,
+  zoom each one with the mouse wheel, and pop any of them out into a window of its own.
 
 Media Foundation does the conversion, encoding, resampling and MP4 writing, through the
 [MediaFoundation](https://www.nuget.org/packages/MediaFoundation) wrapper package.
@@ -46,7 +49,8 @@ finalizes the MP4 files, which are in your TEMP folder unless you set `--output-
 Useful variations:
 
 ```powershell
-capture --list-devices                    # screens, audio devices, H.264 encoders
+capture --list-devices                    # screens, cameras, audio devices, H.264 encoders
+capture --camera 1 --camera-fps 15        # the first camera as well, at 15 fps
 capture --layout desktop                  # all screens as one stream
 capture --screens 1                       # only screen 1
 capture --no-record --no-stream           # start idle; begin from the viewer
@@ -76,6 +80,8 @@ the program's own defaults apply until you change one.
   "layout": "separate",          // "separate" (a stream per screen) or "desktop" (one stream)
   "screens": [1, 2],             // which screens; leave out for all
   "fps": 30,                     // 1-60; viewers can change it while running
+  "camera": "Live Camera",       // a camera to capture as well, by number or part of the name; leave out for none
+  "cameraFps": 30,               // 1-60, the camera's own; viewers can change it too
   "videoMode": "h264",           // "h264" (WebRTC) or "jpeg" (pictures over the WebSocket)
   "audioSource": "microphone",   // Windows' default devices: "microphone", "desktop", "both" or "none"
   "audioDevice": ["Headset"],    // particular devices, by number or part of the name (see below)
@@ -87,7 +93,8 @@ the program's own defaults apply until you change one.
 }
 ```
 
-Screens are numbered from 1, in the order `capture --list-devices` shows them.
+Screens and cameras are numbered from 1, in the order `capture --list-devices` shows them.
+`--camera none` on the command line undoes a camera named in the file (in the file, `"camera": "none"` or `false`).
 
 Audio comes from Windows' default devices unless particular ones are named: `"microphone"` is the
 default recording device, `"desktop"` what the default playback device plays. Each `audioDevice`
@@ -102,8 +109,8 @@ JavaScript modules, no build step or dependencies). The page talks to the captur
 `viewer.js` is the page; `protocol.js` has the messages, `zoom.js`, `pcm-player.js` and
 `format.js` the parts that stand on their own.
 
-- **Screens**: one tile per stream, arranged the way the screens are arranged on the desktop.
-  Each tile shows its size, frame rate and bit rate.
+- **Screens**: one tile per stream, arranged the way the screens are arranged on the desktop, with
+  the camera's after them. Each tile shows its size, frame rate and bit rate.
 - **Watch**: tick the screens to show in this window. Screens nobody watches are not sent, and if
   nothing else needs them (no recording) they are not captured at all.
 - **Zoom**: scroll the mouse wheel over a screen to zoom in around the pointer, drag to move
@@ -113,7 +120,11 @@ JavaScript modules, no build step or dependencies). The page talks to the captur
   screen to the main window. A pop-out window has its own connection to the capture client, asks
   for only its screen and plays no sound, so audio is never heard twice.
 - **Remote control**: Start / Pause / Stop for recording and for streaming, the layout, the video
-  method and the frame rate. The panel always shows the capture client's actual state.
+  method and the screens' frame rate. The panel always shows the capture client's actual state.
+- **Camera**: which camera to capture (or **Off**) and its frame rate, separate from the screens'.
+  The camera then appears under Watch and as a tile like a screen, and can be zoomed and popped out
+  the same way. Under the heading: the mode the camera runs in and how it is encoded, or why it
+  cannot be used.
 - **Audio devices**: every recording device and every playback device of the capture client's PC,
   each with a tick box: ticked devices are mixed into the audio. Each group starts with **Default
   device**, which follows Windows' default. Under each device: whether it is live (and the format
@@ -131,6 +142,10 @@ for each stream (each screen, or the whole desktop):
                   ├─► video processor MFT (BGRX → NV12, scaling) ─► H.264 encoder MFT ─┬─► MP4 sink writer
                   │                                                                    └─► WebRTC track
                   └─► JPEG encoder ────────────────────────────────────────────────────► WebSocket
+
+the camera, if one is chosen:
+  camera ──► MF source reader (decodes MJPG, converts NV12/YUY2 to RGB32) ──► newest picture ──► BGRX frame,
+             read at the camera's frame rate and from there handled like a screen's
 
 each recording device (MF source reader) ─► resampler MFT ─┐
 each playback device (WASAPI loopback) ───► resampler MFT ─┴─► mixer: 20 ms frames, 8 kHz PCM ─┬─► AAC in every MP4
@@ -175,6 +190,26 @@ each playback device (WASAPI loopback) ───► resampler MFT ─┴─► m
 - **Layout changes** set the streams up again from scratch: viewers get a new WebRTC session with
   the new set of tracks, and a recording in progress continues in new files. Setting the layout
   also looks the screens up again, so it picks up screens that were added, removed or rearranged.
+  The camera's stream is not touched.
+- **The camera** runs at its own pace on a thread of its own, and its stream reads the newest
+  picture at the camera's frame rate. Of the modes the camera offers, among those at least as fast
+  as that rate (if none is, the fastest, whose pictures are repeated to make up the rate), it runs
+  in the one giving the largest video within `--max-width`/`--max-height`, and of those the
+  smallest picture (and uncompressed NV12 or YUY2 rather than MJPG when both are offered), so a
+  camera is not decoded at 4K only for its video to be scaled down to 720p. The camera is only
+  open while its stream is recorded or watched, so its light is off and other programs can use it
+  the rest of the time; each time it is opened, its stream starts with the camera's first picture,
+  not black or a picture from the last time. If it is unplugged or another program holds it, the
+  stream repeats the last picture, the viewer says why, and the camera is opened again every two
+  seconds until it delivers. A change of the camera's frame rate keeps its mode when that still
+  fits, and replaces only the encoder, as for the screens; otherwise the camera's stream is set up
+  again in the better mode. Switching the camera on, off or to another one is a change of streams
+  like a layout change: viewers get a new WebRTC session and a recording continues in new files.
+  The new stream is set up before the old one is taken down, so a camera that cannot be used is
+  refused and the one before carries on. If the camera's stream fails (its encoder, say), the
+  capture carries on without it and the viewer says why; a screen's failure still ends the
+  capture. Its sound is not part of the stream: a camera's microphone is one more recording device
+  under Audio devices.
 
 ### Recording
 
@@ -191,8 +226,9 @@ upsampled to 48 kHz and encoded as AAC-LC.
   `...-screen2.mp4`; with a single stream (the desktop layout, or `--screens 1`) just
   `capture-<date>-<time>.mp4`. With `-o name.mp4` the files are named after `name`; a relative
   `-o` is in the output folder, a full path is used as it is.
-- Every start makes new files (`name-2-screen1.mp4`, ...), and so does a layout change while
-  recording.
+- The camera has a file of its own too: `...-camera.mp4`.
+- Every start makes new files (`name-2-screen1.mp4`, ...), and so does a layout change, or
+  switching the camera on, off or to another one, while recording.
 - A pause leaves no gap: the files' timeline continues at the point of resuming.
 - An MP4 file is only playable once finalized (on stop, or Ctrl+C). `--segment <seconds>` starts
   new files every N seconds (`name-screen1-001.mp4`, ...) so that a crash costs at most one segment.
@@ -223,7 +259,7 @@ From the capture client:
 
 | Message | Meaning |
 |---|---|
-| `{"type":"state", "remoteControl":true, "layout":"separate", "recording":{…}, "streaming":{…}, "video":{…}, "sources":[…], "audio":{…}}` | Current state; sent on connect, on every change and once a second. |
+| `{"type":"state", "remoteControl":true, "layout":"separate", "recording":{…}, "streaming":{…}, "video":{…}, "sources":[…], "audio":{…}, "camera":{…}}` | Current state; sent on connect, on every change and once a second. |
 | `{"type":"error","message":"…","request":7}` | A request was refused, or failed. `message` is written for the person who asked; `request` is the request's `id`, if it had one. |
 | `{"type":"offer","sdp":"…","sources":{"1":"screen1","2":"screen2"}}` | WebRTC offer (H.264 mode), with the stream each video section (by `mid`) carries. Reply with the answer. |
 | `{"candidate":"…","sdpMid":"…","sdpMLineIndex":0}` | ICE candidate. |
@@ -234,8 +270,9 @@ The parts of the state:
 |---|---|
 | `recording` | `state` (`stopped`, `recording`, `paused`), `files` (the file names being written), `seconds` (recorded, pauses left out), `bytes` |
 | `streaming` | `state` (`stopped`, `streaming`, `paused`), `viewers` (clients being sent media), `clients` (clients connected) |
-| `video` | `mode` (`h264` or `jpeg`), `frameRate`, `jpegQuality` |
-| each of `sources` | `id` (`screen1`, `screen2`, … or `desktop`), `number` (the screen number, 0 for the desktop), `name`, `screens`, `primary`, position and size on the desktop (`left`, `top`, `width`, `height`), the encoded size (`videoWidth`, `videoHeight`), `bitrateKbps`, `capturing` (whether anything uses it), `viewers` (clients receiving it), `capture` (the capture method), `encoder` and `hardware` |
+| `video` | `mode` (`h264` or `jpeg`), `frameRate` (the screens'), `jpegQuality` |
+| each of `sources` | `id` (`screen1`, `screen2`, …, `desktop` or `camera`), `number` (the screen number, 0 for the desktop, 100 for the camera), `kind` (`screen`, `desktop` or `camera`), `name`, `screens`, `primary`, position and size on the desktop (`left`, `top`, `width`, `height`; for the camera 0, 0 and its picture size), the encoded size (`videoWidth`, `videoHeight`), `frameRate`, `bitrateKbps`, `capturing` (whether anything uses it), `viewers` (clients receiving it), `capture` (the capture method, for the camera its mode: `camera, NV12 1920x1080 at 30 fps`), `encoder` and `hardware` |
+| `camera` | `selected` (the id of the camera being captured, or null), `frameRate`, `mode` (how it runs, for display), `problem` (why it is not delivering pictures, or why the last one asked for could not be used), `devices` (each camera's `id`, `name` and whether it is `selected`) |
 | `audio` | `enabled`, `selected` (the ids being recorded), `source` (`microphone`, `desktop`, `both` or `none` when the selection is just default devices, otherwise `devices`), `description`, `sampleRate`, `devices` |
 
 Each entry of `audio.devices`:
@@ -254,7 +291,7 @@ To the capture client:
 |---|---|
 | `{"type":"select","sources":["screen1"],"audio":true}` | Which streams this client wants, and whether it wants sound. Until a client says, it gets everything. Allowed even when remote control is off. |
 | `{"type":"command","target":"recording","action":"start","id":7}` | `target`: `recording` or `streaming`; `action`: `start`, `stop`, `pause`, `resume`. |
-| `{"type":"configure","frameRate":15,"id":8}` | Also `"layout":"separate"\|"desktop"`, `"videoMode":"h264"\|"jpeg"`, `"audioDevices":["default-input","{0.0.0.00000000}.{…}"]` (exactly the devices to record) and `"audioSource":"microphone"\|"desktop"\|"both"\|"none"` (shorthand for the default devices). Every setting is checked before any is applied: a request with a mistake in it changes nothing. |
+| `{"type":"configure","frameRate":15,"id":8}` | Also `"layout":"separate"\|"desktop"`, `"videoMode":"h264"\|"jpeg"`, `"camera":"<id from camera.devices>"\|"none"`, `"cameraFrameRate":15`, `"audioDevices":["default-input","{0.0.0.00000000}.{…}"]` (exactly the devices to record) and `"audioSource":"microphone"\|"desktop"\|"both"\|"none"` (shorthand for the default devices). Every setting is checked before any is applied: a request with a mistake in it changes nothing. |
 | `{"type":"answer","sdp":"…"}` | WebRTC answer. |
 | `{"candidate":"…","sdpMid":"…","sdpMLineIndex":0}` | ICE candidate. |
 
@@ -267,7 +304,7 @@ little-endian timestamp in 100 ns units, then the payload.
 
 | Type | Payload |
 |---|---|
-| `1` | A JPEG picture of the stream with that number. |
+| `1` | A JPEG picture of the stream with that number (100: the camera). |
 | `2` | 20 ms of 16-bit little-endian PCM, 8 kHz mono (stream number 0). |
 
 ## Security
@@ -304,12 +341,17 @@ this PC's real devices: every connected device is recorded at once. The viewer p
 accepted and refused, the state's JSON, the binary framing), the origin check, RTP packetization
 and the command-line options have tests of their own.
 
+Camera modes are chosen, and cameras found by number and name, in tests with made-up cameras;
+with a real camera, tests check that it delivers pictures only while they are wanted and that its
+stream is encoded at its own frame rate.
+
 Some tests need things not every machine has: an interactive desktop, desktop duplication, two
-screens, audio devices. Without them those tests are reported as skipped, with the reason; they
-never pass without checking.
+screens, audio devices, a camera. Without them those tests are reported as skipped, with the
+reason; they never pass without checking.
 
 The end-to-end test also chooses screens, zooms, pops a screen out into its own window and back,
-ticks and unticks audio devices, and switches between the two layouts. It runs the capture client
+ticks and unticks audio devices, switches between the two layouts, and (with a camera) captures
+the camera at its own frame rate, records it, shows it as JPEG and switches it off. It runs the capture client
 with an empty configuration file, so a local `capture.json` does not change what it tests. When a
 check fails it shows the logs and keeps its output folder.
 
@@ -318,7 +360,7 @@ check fails it shows the logs and keeps its output folder.
 ```
 src/Capture/            the capture client: options, the capture session that wires it together, the status line
   Video/                screens and capture areas, capture (desktop duplication, GDI, HDR conversion),
-                        conversion, H.264 encoders and JPEG, the video pipeline
+                        cameras, conversion, H.264 encoders and JPEG, the video pipeline
   Audio/                audio devices and selection, recording-device and loopback sources, timeline, mixer, resampler
   Output/               MP4 recorder; stream server, one connection per viewer, WebRTC sessions, RTP
                         packetization; the viewer protocol and the audio device list viewers see
@@ -346,6 +388,8 @@ tests/EndToEnd.ps1      end-to-end smoke test
 - A playback device is recorded as what Windows sends to it; a device nothing is playing on
   records silence.
 - WebRTC sending has no congestion control: it suits a LAN, not a constrained link.
+- One camera at a time. Its picture is converted to RGB32 and back to NV12 on the CPU, like a
+  screen's: cheap at 720p, noticeable at 1080p and above on a machine without a hardware encoder.
 
 ## Third-party components
 
